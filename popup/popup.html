@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YouTube Transcript & Insights</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <!-- Header -->
+  <div class="header">
+    <div class="header-left">
+      <div class="logo">YT</div>
+      <h1 class="video-title" id="videoTitle">Open a YouTube video</h1>
+    </div>
+    <button class="icon-btn" id="settingsBtn" title="Settings">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="3"></circle>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+      </svg>
+    </button>
+  </div>
+
+  <!-- Action Bar -->
+  <div class="action-bar">
+    <div class="toggle-group">
+      <button class="toggle-btn active" id="timestampedBtn">Timestamped</button>
+      <button class="toggle-btn" id="plainBtn">Plain Text</button>
+    </div>
+    <div class="action-buttons">
+      <button class="btn btn-secondary" id="copyBtn" title="Copy transcript">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+        </svg>
+        Copy
+      </button>
+      <button class="btn btn-primary" id="insightsBtn">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+        </svg>
+        Get Insights
+      </button>
+    </div>
+  </div>
+
+  <!-- Loading State -->
+  <div class="loading" id="loadingState" style="display: none;">
+    <div class="spinner"></div>
+    <p>Extracting transcript...</p>
+  </div>
+
+  <!-- Error State -->
+  <div class="error-state" id="errorState" style="display: none;">
+    <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+      <circle cx="12" cy="12" r="10"></circle>
+      <line x1="12" y1="8" x2="12" y2="12"></line>
+      <line x1="12" y1="16" x2="12.01" y2="16"></line>
+    </svg>
+    <p id="errorMessage" style="user-select: text; cursor: text; max-height: 120px; overflow-y: auto; word-break: break-word; font-size: 11px; padding: 6px; background: rgba(255,255,255,0.05); border-radius: 4px;">No transcript available</p>
+    <button class="btn btn-secondary" id="retryBtn">Retry</button>
+  </div>
+
+  <!-- Empty State -->
+  <div class="empty-state" id="emptyState">
+    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1">
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+      <polyline points="14 2 14 8 20 8"></polyline>
+      <line x1="16" y1="13" x2="8" y2="13"></line>
+      <line x1="16" y1="17" x2="8" y2="17"></line>
+      <polyline points="10 9 9 9 8 9"></polyline>
+    </svg>
+    <p>Navigate to a YouTube video to get its transcript</p>
+  </div>
+
+  <!-- Transcript Area -->
+  <div class="transcript-container" id="transcriptContainer" style="display: none;">
+    <div class="transcript-content" id="transcriptContent"></div>
+  </div>
+
+  <!-- Settings Modal -->
+  <div class="modal-overlay" id="settingsModal" style="display: none;">
+    <div class="modal">
+      <div class="modal-header">
+        <h2>Settings</h2>
+        <button class="icon-btn" id="closeSettings">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <label for="supadataKeyInput">Supadata API Key (required for transcripts)</label>
+        <input type="password" id="supadataKeyInput" placeholder="sd_..." autocomplete="off">
+        <p class="hint">100 free requests/month. Get a key at <a href="https://supadata.ai" target="_blank">supadata.ai</a></p>
+        <div style="margin-top: 12px;"></div>
+        <label for="apiKeyInput">Anthropic API Key (optional)</label>
+        <input type="password" id="apiKeyInput" placeholder="sk-ant-..." autocomplete="off">
+        <p class="hint">Get one at <a href="https://console.anthropic.com/" target="_blank">console.anthropic.com</a></p>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="cancelSettings">Cancel</button>
+        <button class="btn btn-primary" id="saveSettings">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
