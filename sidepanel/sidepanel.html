@@ -39,7 +39,7 @@
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
         </svg>
-        Get Insights
+        Summarize
       </button>
     </div>
   </div>
@@ -73,11 +73,6 @@
     <p>Navigate to a YouTube video to get its transcript</p>
   </div>
 
-  <!-- Transcript Area -->
-  <div class="transcript-container" id="transcriptContainer" style="display: none;">
-    <div class="transcript-content" id="transcriptContent"></div>
-  </div>
-
   <!-- Insights Area -->
   <div class="insights-container" id="insightsContainer" style="display: none;">
     <div class="insights-header" id="insightsHeader">
@@ -85,19 +80,41 @@
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
         </svg>
-        AI Insights
+        AI Summary
       </h2>
-      <button class="icon-btn" id="toggleInsights" title="Toggle insights">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <polyline points="6 9 12 15 18 9"></polyline>
-        </svg>
-      </button>
+      <div class="insights-header-actions">
+        <button class="chip-btn" id="starFilterBtn" title="Show only starred items">
+          <span class="star-glyph">★</span> Starred
+        </button>
+        <button class="icon-btn" id="toggleInsights" title="Collapse / expand">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="6 9 12 15 18 9"></polyline>
+          </svg>
+        </button>
+      </div>
     </div>
-    <div class="insights-content" id="insightsContent"></div>
     <div class="insights-loading" id="insightsLoading" style="display: none;">
       <div class="spinner"></div>
-      <p>Generating insights with Claude...</p>
+      <p id="insightsLoadingText">Analyzing the video...</p>
     </div>
+    <div class="insights-content" id="insightsContent"></div>
+  </div>
+
+  <!-- Transcript Area. Collapsed by default: the summary is the point of the
+       panel, and the raw transcript is what you open when you want it. -->
+  <div class="transcript-container transcript-collapsed" id="transcriptContainer" style="display: none;">
+    <div class="transcript-header" id="transcriptHeader">
+      <h2>Transcript</h2>
+      <div class="transcript-header-actions">
+        <span class="group-count" id="transcriptCount"></span>
+        <button class="icon-btn" id="toggleTranscript" title="Show / hide the transcript" aria-expanded="false">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="6 9 12 15 18 9"></polyline>
+          </svg>
+        </button>
+      </div>
+    </div>
+    <div class="transcript-content" id="transcriptContent"></div>
   </div>
 
   <!-- Settings Modal -->
@@ -117,9 +134,55 @@
         <input type="password" id="supadataKeyInput" placeholder="sd_..." autocomplete="off">
         <p class="hint">100 free requests/month. Get a key at <a href="https://supadata.ai" target="_blank">supadata.ai</a></p>
         <div style="margin-top: 16px;"></div>
-        <label for="apiKeyInput">Anthropic API Key (for AI Insights)</label>
-        <input type="password" id="apiKeyInput" placeholder="sk-ant-..." autocomplete="off">
-        <p class="hint">Get one at <a href="https://console.anthropic.com/" target="_blank">console.anthropic.com</a></p>
+        <label for="providerSelect">Summarize with</label>
+        <select id="providerSelect">
+          <option value="cursor">My Cursor account (API key)</option>
+          <option value="webhook">My Cursor automation (webhook)</option>
+          <option value="anthropic">Anthropic API key</option>
+        </select>
+        <p class="hint">Cursor mode calls api.cursor.com directly and bills your Cursor subscription instead of an Anthropic key. It lists whatever models your account has.</p>
+
+        <!-- Anthropic-key mode -->
+        <div id="anthropicSettings">
+          <div style="margin-top: 16px;"></div>
+          <label for="apiKeyInput">Anthropic API Key (required for AI Summary)</label>
+          <input type="password" id="apiKeyInput" placeholder="sk-ant-..." autocomplete="off">
+          <p class="hint">Used to generate the summary in this panel. Get one at <a href="https://console.anthropic.com/" target="_blank">console.anthropic.com</a></p>
+          <div style="margin-top: 16px;"></div>
+          <label for="modelSelect">Summary model</label>
+          <select id="modelSelect">
+            <option value="claude-sonnet-4-6">Sonnet 4.6 — fast &amp; affordable (default)</option>
+            <option value="claude-opus-4-8">Opus 4.8 — deepest analysis</option>
+            <option value="claude-haiku-4-5">Haiku 4.5 — cheapest</option>
+          </select>
+          <p class="hint">Sonnet is a good balance for most videos. Opus digs deeper on dense talks.</p>
+        </div>
+
+        <!-- Cursor API-key mode -->
+        <div id="cursorSettings" style="display: none;">
+          <p class="hint" id="webhookNote" style="display: none;">Firing your Cursor <strong>automation</strong> instead of creating an agent. Its container is already warm, which starts the run about 20s sooner. The <em>automation</em> picks the model — a model sent from here is ignored — so set the effort level on the automation itself. The Cursor API key below is still needed to read the result back.</p>
+          <div id="cursorModelRow">
+          <div style="margin-top: 16px;"></div>
+          <label for="cursorModelSelect">Cursor model</label>
+          <select id="cursorModelSelect">
+            <option value="auto">Auto (Cursor picks)</option>
+          </select>
+          <p class="hint">Defaults to <code>CURSOR_DEFAULT_MODEL</code> in <code>lib/config.js</code> — Grok 4.6, <strong>low</strong> effort, fast. Low is deliberate: measured against medium and high, it was ~2× faster with more specifics and the same coverage. Pick a <em>medium</em> variant for finer-grained sections (+13s); high is slower <em>and</em> vaguer.</p>
+          <p class="hint" id="cursorKeyStatus">Checking your Cursor key…</p>
+          <button class="btn btn-secondary" id="refreshCursorModels" style="margin-top: 8px;">Refresh models from Cursor</button>
+          </div>
+          <div style="margin-top: 16px;"></div>
+          <label for="cursorApiKeyInput">Cursor API key (optional override)</label>
+          <input type="password" id="cursorApiKeyInput" placeholder="Using the key from lib/config.js" autocomplete="off">
+          <p class="hint">The key is normally hard-coded in <code>lib/config.js</code>. Fill this in only to use a different one; leave it blank to fall back to the built-in key. Keys come from <a href="https://cursor.com/dashboard" target="_blank">cursor.com/dashboard</a> → Integrations.</p>
+        </div>
+
+        <div style="margin-top: 16px;"></div>
+        <label class="checkbox-row" for="autoSummarizeInput">
+          <input type="checkbox" id="autoSummarizeInput" checked>
+          <span>Start summarizing as soon as I open a video</span>
+        </label>
+        <p class="hint">Runs in the background the moment a YouTube video loads — no need to open this panel. A Cursor summary takes minutes, so starting it while you watch usually means it's already waiting when you check. Turn this off to only summarize when you press the button.</p>
       </div>
       <div class="modal-footer">
         <button class="btn btn-secondary" id="cancelSettings">Cancel</button>
@@ -128,6 +191,7 @@
     </div>
   </div>
 
+  <script src="../lib/config.js"></script>
   <script src="../lib/claude-api.js"></script>
   <script src="sidepanel.js"></script>
 </body>
