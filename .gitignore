@@ -1,0 +1,4 @@
+# Holds the hard-coded Cursor API key — keep it out of git.
+lib/config.js
+
+.DS_Store

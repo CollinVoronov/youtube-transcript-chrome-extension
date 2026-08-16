@@ -40,16 +40,13 @@ if (titleEl) {
   titleObserver.observe(titleEl, { childList: true });
 }
 
+// Seeking lives in the service worker (it injects into the page directly), so
+// there's deliberately no SEEK_TO handler here — a listener in this script
+// stops working the moment the extension is reloaded, which is exactly the
+// failure it used to cause.
+
 // Listen for messages from background/sidepanel
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === 'SEEK_TO') {
-    const video = document.querySelector('video');
-    if (video) {
-      video.currentTime = message.time;
-      video.play();
-    }
-  }
-
   if (message.type === 'GET_VIDEO_INFO') {
     sendResponse({
       videoId: getVideoId(),
