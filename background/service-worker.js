@@ -618,6 +618,11 @@ function resumePartRun(videoId, parts, settings) {
 
     const entry = { progress: 'Reconnecting to the Cursor agent…', startedAt: Date.now(), promise: null };
     inFlightParts.set(key, entry);
+    // Same guard the live rerun path uses. A recovered part is by definition
+    // old, and a whole-summary run can start at any point after the worker
+    // comes back — including the resumeInsights() call immediately below this
+    // one — so it must not fold itself into a newer summary.
+    const epoch = currentEpoch(videoId);
 
     entry.promise = (async () => {
       try {
@@ -628,13 +633,21 @@ function resumePartRun(videoId, parts, settings) {
             broadcast({ type: 'PART_PROGRESS', videoId, part, message: progressMessage });
           }
         );
+
+        if (currentEpoch(videoId) !== epoch) {
+          logPrep(`part DROPPED video=${videoId} part=${part} — superseded while recovering`);
+          return { superseded: true };
+        }
+
         const insights = await mergePartIntoCache(videoId, part, pickPartKeys(part, value));
         logPrep(`part RESUMED video=${videoId} part=${part}`);
         broadcast({ type: 'PART_DONE', videoId, part, insights });
         return { insights };
       } catch (err) {
         const error = err?.message || `Could not recover the ${PART_LABELS[part]} run.`;
-        broadcast({ type: 'PART_ERROR', videoId, part, error });
+        if (currentEpoch(videoId) === epoch) {
+          broadcast({ type: 'PART_ERROR', videoId, part, error });
+        }
         return { error };
       } finally {
         inFlightParts.delete(key);
@@ -710,7 +723,7 @@ function resumeInsights(videoId, parts, settings) {
 // Same rule as the panel's cleanTitle: while a playlist navigates, the tab
 // title is briefly the playlist ("Watch later") or bare "YouTube". Caching one
 // of those as the video title makes it stick for that video.
-const PLACEHOLDER_TITLES = ['youtube', 'watch later', 'watch', ''];
+const PLACEHOLDER_TITLES = ['youtube', 'youtube video', 'watch later', 'watch', ''];
 
 function cleanTabTitle(title) {
   const bare = (title || '').replace(' - YouTube', '').replace(/^\(\d+\)\s*/, '').trim();
@@ -1004,8 +1017,10 @@ async function handleGetTranscript(tabId, expectedVideoId) {
     if (result.error) return { error: result.error };
 
     // Title comes from THIS request's tab; the transcript array itself is shared.
-    const title = cleanTabTitle(tab.title) || 'YouTube Video';
-    return { transcript: result.transcript, title, videoId };
+    // Null rather than a stand-in string: the panel treats any non-empty title
+    // as the real one, caches it, and then ignores the actual title when it
+    // arrives a moment later — so a fabricated "YouTube Video" would stick.
+    return { transcript: result.transcript, title: cleanTabTitle(tab.title), videoId };
   } catch (err) {
     return { error: err.message || 'Unknown error fetching transcript' };
   }

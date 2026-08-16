@@ -128,7 +128,9 @@ async function syncToActiveTab() {
 // Titles YouTube shows transiently while a playlist navigates. Taking one of
 // these as the video title puts "Watch later" in the header — and caches it
 // alongside the transcript, so it sticks.
-const PLACEHOLDER_TITLES = ['youtube', 'watch later', 'watch', ''];
+// 'youtube video' was a stand-in an earlier build sent when the tab title was
+// not yet real; it is still in transcript caches written back then.
+const PLACEHOLDER_TITLES = ['youtube', 'youtube video', 'watch later', 'watch', ''];
 
 function setVideoTitle(title) {
   videoTitle.textContent = title;
