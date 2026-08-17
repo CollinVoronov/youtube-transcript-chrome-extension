@@ -28,6 +28,13 @@ let lastGoodStarred = null;
 // navigation YouTube reports "Watch later" first and the real title a moment
 // later, so a late title for the video we are already on must still be taken.
 let hasRealTitle = false;
+// Per-video view state: which groups the reader had open, how the transcript
+// was showing, and where they had scrolled to. `viewStateReady` is false for
+// the duration of a load so the resets a load performs on its way to the
+// restored view are never mistaken for choices and written back.
+let viewStateReady = false;
+let pendingViewWrite = null;  // { videoId, state } captured at change time
+let viewSaveTimer = null;
 
 // DOM Elements
 const videoTitle = document.getElementById('videoTitle');
@@ -154,6 +161,12 @@ function cleanTitle(title) {
 // Results that arrive after the user has moved on (different tab or newer
 // load) are discarded.
 async function loadTranscript(expectedVideoId, titleHint) {
+  // The video we are leaving may still have a scroll position waiting on the
+  // debounce. Get it down before currentVideoId moves on, and stop recording
+  // until the new video's view has been restored.
+  flushViewState();
+  viewStateReady = false;
+
   if (!currentTabId) {
     resetToEmpty();
     return;
@@ -179,10 +192,10 @@ async function loadTranscript(expectedVideoId, titleHint) {
   showState('loading');
   // Hide any summary from the previous video while the new one loads.
   resetInsightsUI();
-  // And re-collapse the transcript: opening it was a choice about the last
-  // video, not a standing preference.
-  transcriptContainer.classList.add('transcript-collapsed');
-  document.getElementById('toggleTranscript')?.setAttribute('aria-expanded', 'false');
+  // And re-collapse the transcript until we know how THIS video was left: the
+  // saved view read below reopens it if that is how the reader had it, and a
+  // video never seen before starts collapsed like a fresh panel.
+  setTranscriptOpen(false);
 
   // True only while this load is still the one the panel cares about.
   const isCurrent = () => seq === loadSeq && reqTabId === currentTabId;
@@ -196,10 +209,17 @@ async function loadTranscript(expectedVideoId, titleHint) {
       cached = await chrome.storage.local.get([
         STORE_PREFIX_TRANSCRIPT + videoId,
         STORE_PREFIX_INSIGHTS + videoId,
-        STORE_PREFIX_STARRED + videoId
+        STORE_PREFIX_STARRED + videoId,
+        STORE_PREFIX_VIEW + videoId
       ]);
       if (!isCurrent()) return;
     }
+
+    // How this video was left. The transcript half is applied now, before the
+    // cues are built, so the transcript draws in the right mode once rather
+    // than being rendered and then redrawn.
+    const savedView = videoId ? cached[STORE_PREFIX_VIEW + videoId] : null;
+    applyTranscriptViewState(savedView);
 
     // 2) Transcript: serve from cache (no Supadata request → no extra credits)
     //    or fetch it once and cache it for next time.
@@ -259,7 +279,7 @@ async function loadTranscript(expectedVideoId, titleHint) {
     //    else attach to a run the worker already has going for this video, else
     //    start one. Asking the worker first is what stops a panel opened during
     //    a background prep from kicking off a second paid run for the same video.
-    const hadCachedSummary = applyCachedInsights(cached, videoId);
+    const hadCachedSummary = applyCachedInsights(cached, videoId, savedView);
     if (!isCurrent()) return;
 
     // Ask the worker what it has going for this video even when a summary is
@@ -285,6 +305,11 @@ async function loadTranscript(expectedVideoId, titleHint) {
     } else if (!hadCachedSummary && canSummarize()) {
       generateInsights();
     }
+
+    // The panel is fully painted: put the reader back at the place they left
+    // off, and start recording their choices about this video from here on.
+    restoreScroll(savedView?.scroll, seq);
+    viewStateReady = true;
   } catch (err) {
     if (!isCurrent()) return;
     showError(`Failed to load transcript: ${err.message}`);
@@ -294,6 +319,8 @@ async function loadTranscript(expectedVideoId, titleHint) {
 // Clear the panel back to the empty state (no video / non-YouTube tab).
 function resetToEmpty() {
   ++loadSeq; // cancel any in-flight load
+  flushViewState();   // the video being left keeps whatever it was showing
+  viewStateReady = false;
   currentTranscript = null;
   currentVideoId = null;
   videoTitle.textContent = 'Open a YouTube video';
@@ -315,6 +342,101 @@ function resetInsightsUI() {
   if (filterBtn) filterBtn.classList.remove('active');
   insightsContainer.style.display = 'none';
   insightsContent.innerHTML = '';
+}
+
+// ---- Per-video view state ----
+//
+// A video you come back to should look the way you left it. Without this, every
+// return trip costs the same two moves — reopen the section you were reading,
+// scroll back down to where you stopped — on a panel whose whole point is to
+// save you that work. So which groups are open, how the transcript is showing,
+// and the scroll position are all remembered against the video id.
+
+function scrollEl() {
+  return document.scrollingElement || document.documentElement;
+}
+
+// Everything the panel remembers about how the current video was left.
+function currentViewState() {
+  return {
+    groups: [...openGroups],
+    summaryExpanded,
+    starredOnly: showStarredOnly,
+    insightsCollapsed: insightsContainer.classList.contains('insights-collapsed'),
+    transcriptOpen: !transcriptContainer.classList.contains('transcript-collapsed'),
+    plainText: !showTimestamps,
+    scroll: Math.round(scrollEl().scrollTop)
+  };
+}
+
+// Record how the current video is being viewed. Discrete choices — opening a
+// group, flipping a toggle — write straight through; scrolling fires
+// continuously, so it is debounced.
+function saveViewState({ immediate = false } = {}) {
+  if (!viewStateReady || !currentVideoId) return;
+  pendingViewWrite = { videoId: currentVideoId, state: currentViewState() };
+  if (immediate) {
+    flushViewState();
+    return;
+  }
+  clearTimeout(viewSaveTimer);
+  viewSaveTimer = setTimeout(flushViewState, 400);
+}
+
+// Write the pending snapshot now. It carries the video that was current when
+// the change happened, so a debounced write landing after a video switch still
+// goes to the right record instead of stamping the new video with the old
+// one's view. Best-effort: a failed write just costs the reader their place.
+function flushViewState() {
+  clearTimeout(viewSaveTimer);
+  viewSaveTimer = null;
+  const write = pendingViewWrite;
+  pendingViewWrite = null;
+  if (!write) return;
+  chrome.storage.local
+    .set({ [STORE_PREFIX_VIEW + write.videoId]: write.state })
+    .catch(() => {});
+}
+
+function setTranscriptView(timestamped) {
+  showTimestamps = timestamped;
+  document.getElementById('timestampedBtn').classList.toggle('active', timestamped);
+  document.getElementById('plainBtn').classList.toggle('active', !timestamped);
+}
+
+function setTranscriptOpen(open) {
+  transcriptContainer.classList.toggle('transcript-collapsed', !open);
+  document.getElementById('toggleTranscript')?.setAttribute('aria-expanded', String(open));
+}
+
+// The transcript half of a saved view. A missing record reads as all-false,
+// which is exactly the fresh-panel default.
+function applyTranscriptViewState(view) {
+  setTranscriptView(!view?.plainText);
+  setTranscriptOpen(!!view?.transcriptOpen);
+  insightsContainer.classList.toggle('insights-collapsed', !!view?.insightsCollapsed);
+}
+
+// The summary half. Runs after resetInsightsUI has cleared these back to their
+// defaults and before the first render, so the groups come back already open
+// rather than being drawn collapsed and then reopened a frame later.
+function applyInsightsViewState(view) {
+  openGroups.clear();
+  if (Array.isArray(view?.groups)) for (const key of view.groups) openGroups.add(key);
+  summaryExpanded = !!view?.summaryExpanded;
+  showStarredOnly = !!view?.starredOnly;
+  document.getElementById('starFilterBtn')?.classList.toggle('active', showStarredOnly);
+}
+
+// Put the reader back where they were. Two frames out: the first lets the
+// browser lay out the content that was just built, and a scrollTop set before
+// that is silently clamped to 0. `seq` drops the restore if the panel has since
+// moved on to another video.
+function restoreScroll(top, seq) {
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (seq !== loadSeq) return;
+    scrollEl().scrollTop = top || 0;
+  }));
 }
 
 // Render transcript
@@ -428,6 +550,9 @@ async function copyTranscript() {
 const STORE_PREFIX_INSIGHTS = 'insights:';
 const STORE_PREFIX_STARRED = 'starred:';
 const STORE_PREFIX_TRANSCRIPT = 'transcript:';
+// How the panel was left for a given video — see the view-state block above.
+// Panel-only, so unlike the three above it has no counterpart in the worker.
+const STORE_PREFIX_VIEW = 'view:';
 
 // Sort sections and insights into a stable chronological order so item indices
 // (used as star keys) line up with what's rendered. Idempotent.
@@ -442,9 +567,11 @@ function normalizeInsights(data) {
 }
 
 // Apply a cached summary + stars (already read alongside the transcript in
-// loadTranscript) for `videoId`. Returns true if a cached summary was rendered.
-function applyCachedInsights(cached, videoId) {
+// loadTranscript) for `videoId`, in the groups-open state `savedView` recorded.
+// Returns true if a cached summary was rendered.
+function applyCachedInsights(cached, videoId, savedView) {
   resetInsightsUI();
+  applyInsightsViewState(savedView);
 
   if (!videoId) {
     insightsContainer.style.display = 'none';
@@ -574,6 +701,9 @@ function applyInsights(insights) {
   showStarredOnly = false;
   document.getElementById('starFilterBtn').classList.remove('active');
   renderInsights();
+  // A finished run drops the starred filter, so the stored view has to follow —
+  // otherwise reopening this video would restore a filter that is no longer on.
+  saveViewState({ immediate: true });
 
   const btn = document.getElementById('insightsBtn');
   if (btn) btn.disabled = false;
@@ -935,6 +1065,7 @@ let summaryExpanded = false;
 function toggleGroup(key) {
   if (openGroups.has(key)) openGroups.delete(key);
   else openGroups.add(key);
+  saveViewState({ immediate: true });
   renderInsights();
 }
 
@@ -1154,6 +1285,7 @@ function renderInsights() {
       more.addEventListener('click', (e) => {
         e.stopPropagation();
         summaryExpanded = !summaryExpanded;
+        saveViewState({ immediate: true });
         renderInsights();
       });
       block.appendChild(more);
@@ -1273,17 +1405,15 @@ function showToast(message, type = '') {
 
 // Toggle view
 document.getElementById('timestampedBtn').addEventListener('click', () => {
-  showTimestamps = true;
-  document.getElementById('timestampedBtn').classList.add('active');
-  document.getElementById('plainBtn').classList.remove('active');
+  setTranscriptView(true);
   renderTranscript();
+  saveViewState({ immediate: true });
 });
 
 document.getElementById('plainBtn').addEventListener('click', () => {
-  showTimestamps = false;
-  document.getElementById('plainBtn').classList.add('active');
-  document.getElementById('timestampedBtn').classList.remove('active');
+  setTranscriptView(false);
   renderTranscript();
+  saveViewState({ immediate: true });
 });
 
 // Copy
@@ -1298,13 +1428,15 @@ document.getElementById('insightsBtn').addEventListener('click', () => generateI
 document.getElementById('insightsHeader').addEventListener('click', (e) => {
   if (e.target.closest('#starFilterBtn')) return;
   insightsContainer.classList.toggle('insights-collapsed');
+  saveViewState({ immediate: true });
 });
 
-// The transcript is collapsed on load and opens from its own header. The raw
-// cues are reference material — you go looking for them, they don't greet you.
+// A video you have never opened starts collapsed — the raw cues are reference
+// material, you go looking for them, they don't greet you. Opening it is a
+// choice about this video, so it is remembered and restored on the way back.
 document.getElementById('transcriptHeader').addEventListener('click', () => {
-  const collapsed = transcriptContainer.classList.toggle('transcript-collapsed');
-  document.getElementById('toggleTranscript').setAttribute('aria-expanded', String(!collapsed));
+  setTranscriptOpen(transcriptContainer.classList.contains('transcript-collapsed'));
+  saveViewState({ immediate: true });
 });
 
 // Show only starred items
@@ -1312,8 +1444,18 @@ document.getElementById('starFilterBtn').addEventListener('click', (e) => {
   e.stopPropagation();
   showStarredOnly = !showStarredOnly;
   document.getElementById('starFilterBtn').classList.toggle('active', showStarredOnly);
+  saveViewState({ immediate: true });
   renderInsights();
 });
+
+// Where the reader is in this video. Scrolling fires continuously, so this goes
+// through the debounce. A side panel closing gives us no event of its own, but
+// visibilitychange lands first and is enough to get the last position written.
+window.addEventListener('scroll', () => saveViewState(), { passive: true });
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') flushViewState();
+});
+window.addEventListener('pagehide', flushViewState);
 
 // Settings
 const providerSelect = document.getElementById('providerSelect');
