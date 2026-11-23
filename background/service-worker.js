@@ -900,11 +900,16 @@ function isEnglishLang(code) {
 // catch a whole caption track in another language, like the Arabic track an
 // English talk came back with before this endpoint asked for English.
 async function transcriptLooksEnglish(transcript) {
-  const text = transcript.slice(0, 300).map(cue => cue.text).join('\n');
+  // Sample evenly across the whole track, so an opening in another language
+  // (or an English intro on a foreign track) doesn't decide it alone.
+  const step = Math.max(1, Math.ceil(transcript.length / 300));
+  const text = transcript.filter((_, index) => index % step === 0).map(cue => cue.text).join('\n');
   const letters = text.match(/\p{L}/gu) || [];
-  if (letters.length < 40) return true;
   const nonLatin = letters.filter(letter => !/\p{Script=Latin}/u.test(letter)).length;
-  if (nonLatin > letters.length / 2) return false;
+  // Same bar as the summary language check: even a short track that is
+  // mostly another script isn't English.
+  if (nonLatin >= 12 && nonLatin > letters.length / 2) return false;
+  if (letters.length < 40) return true;
   if (typeof chrome === 'undefined' || !chrome.i18n?.detectLanguage) return true;
   const detected = await new Promise(resolve => {
     try {

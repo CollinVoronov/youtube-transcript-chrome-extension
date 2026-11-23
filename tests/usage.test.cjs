@@ -478,6 +478,27 @@ test('no English transcript is remembered for a week', async () => {
   assert.equal(restarted.calls.transcript, 0);
 });
 
+test('a short untagged Arabic transcript is not tagged English', async () => {
+  const w = worker({ 'transcript:one': { transcript: [{ text: 'حسناً، أم، مجدداً اسمي', startTime: 0 }] } });
+  supadataReply(w, { lang: 'en', content: [{ text: 'All right, again my name is', offset: 0 }] });
+  assert.equal((await w.request(GET_ONE)).transcript[0].text, 'All right, again my name is');
+  assert.equal(w.calls.transcript, 1);
+});
+
+test('the language check samples the whole track, not just its opening', async () => {
+  const english = Array.from({ length: 900 }, (_, i) => ({ text: `This is English caption line number ${i} of the talk.`, startTime: i }));
+  const arabicOpening = [...ARABIC_CUES.flatMap(c => Array(150).fill(c)), ...english];
+  const w = worker({ 'transcript:one': { transcript: arabicOpening } });
+  await w.request(GET_ONE);
+  assert.equal(w.calls.transcript, 0);
+  assert.equal(w.data['transcript:one'].lang, 'en');
+  const englishOpening = [...english.slice(0, 300), ...ARABIC_CUES.flatMap(c => Array(450).fill(c))];
+  const v = worker({ 'transcript:one': { transcript: englishOpening } });
+  supadataReply(v, { lang: 'en', content: [{ text: 'All right, again my name is', offset: 0 }] });
+  await v.request(GET_ONE);
+  assert.equal(v.calls.transcript, 1);
+});
+
 test('regional English tags are accepted', async () => {
   const w = worker();
   supadataReply(w, { lang: 'en-US', content: [{ text: 'Hello there', offset: 0 }] });

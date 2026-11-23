@@ -69,9 +69,8 @@ the completed ones. Retries are bounded per run, so reopening an exhausted
 result does not start another automatic retry loop.
 
 API keys stay on this machine in local extension storage or `lib/config.js`.
-Never commit or distribute `lib/config.js` with personal keys. The key created
-for this personal installation has a $10 monthly usage limit, configurable in
-OpenRouter's key settings.
+Never commit or distribute `lib/config.js` with personal keys. Give the
+OpenRouter key a monthly usage limit in OpenRouter's key settings.
 
 ## Verification
 
