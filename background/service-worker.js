@@ -345,18 +345,12 @@ async function handleRegeneratePart({ videoId, part, transcript, title }) {
   let cues = Array.isArray(transcript) && transcript.length ? transcript : null;
   if (!cues) {
     // The transcript was cached when this video was first summarized, and a
-    // rerun is by definition a video we already have. Refetching would spend a
-    // Supadata credit to get back the exact same cues.
-    const txKey = STORE_PREFIX_TRANSCRIPT + videoId;
-    const stored = await chrome.storage.local.get([txKey]);
-    const cached = stored[txKey]?.transcript;
-    if (Array.isArray(cached) && cached.length) {
-      cues = cached;
-    } else {
-      const result = await fetchTranscript(videoId);
-      if (result.error) return { error: result.error };
-      cues = result.transcript;
-    }
+    // rerun is by definition a video we already have. fetchTranscript serves
+    // the saved English cues without spending a Supadata credit, and only
+    // fetches when the saved transcript is missing or not English.
+    const result = await fetchTranscript(videoId);
+    if (result.error) return { error: result.error };
+    cues = result.transcript;
   }
   if (!cues?.length) return { error: 'No transcript to summarize.' };
 
@@ -471,7 +465,7 @@ async function prepareVideoOnce(videoId, title) {
   }
 
   chrome.storage.local
-    .set({ [STORE_PREFIX_TRANSCRIPT + videoId]: { transcript: result.transcript, title: title || null } })
+    .set({ [STORE_PREFIX_TRANSCRIPT + videoId]: { transcript: result.transcript, title: title || null, lang: TRANSCRIPT_LANG } })
     .catch(() => {});
 
   startInsights(videoId, result.transcript, title, settings);
@@ -890,14 +884,53 @@ const inFlightTranscripts = new Map();
 // spend another credit each time; the panel's Retry button bypasses this.
 const TRANSCRIPT_UNAVAILABLE_TTL_MS = 60 * 60 * 1000;
 
+// Transcripts are English only. Saved transcripts carry `lang` from this
+// change on; older ones (and replies without `lang`) are judged by their text.
+const TRANSCRIPT_LANG = 'en';
+
+function isEnglishLang(code) {
+  return typeof code === 'string' && /^en(?:[-_]|$)/i.test(code);
+}
+
+// Conservative: a short or mixed transcript counts as English. It only has to
+// catch a whole caption track in another language, like the Arabic track an
+// English talk came back with before this endpoint asked for English.
+async function transcriptLooksEnglish(transcript) {
+  const text = transcript.slice(0, 300).map(cue => cue.text).join('\n');
+  const letters = text.match(/\p{L}/gu) || [];
+  if (letters.length < 40) return true;
+  const nonLatin = letters.filter(letter => !/\p{Script=Latin}/u.test(letter)).length;
+  if (nonLatin > letters.length / 2) return false;
+  if (typeof chrome === 'undefined' || !chrome.i18n?.detectLanguage) return true;
+  const detected = await new Promise(resolve => {
+    try {
+      chrome.i18n.detectLanguage(text, result => resolve(chrome.runtime?.lastError ? null : result));
+    } catch {
+      resolve(null);
+    }
+  });
+  const top = detected?.languages?.slice().sort((a, b) => b.percentage - a.percentage)[0];
+  return !(detected?.isReliable && top && top.language !== 'en' && top.language !== 'und' && top.percentage >= 60);
+}
+
 function fetchTranscript(videoId, retryUnavailable = false) {
   let pending = inFlightTranscripts.get(videoId);
   if (!pending) {
     pending = (async () => {
       const key = STORE_PREFIX_TRANSCRIPT + videoId;
       const stored = await chrome.storage.local.get([key]);
-      const cached = stored[key]?.transcript;
-      if (Array.isArray(cached) && cached.length) return { transcript: cached };
+      const entry = stored[key];
+      const cached = entry?.transcript;
+      if (Array.isArray(cached) && cached.length) {
+        if (isEnglishLang(entry.lang)) return { transcript: cached };
+        if (!entry.lang && await transcriptLooksEnglish(cached)) {
+          // Tag it so the panel can serve it straight from storage next time.
+          await chrome.storage.local.set({ [key]: { ...entry, lang: TRANSCRIPT_LANG } }).catch(() => {});
+          return { transcript: cached };
+        }
+        // Saved before transcripts were English only (e.g. an Arabic caption
+        // track): fall through and fetch the English one.
+      }
       const unavailable = stored[key]?.unavailable;
       if (!retryUnavailable && unavailable?.until > Date.now()) {
         return { error: unavailable.error + ' This result is saved for one hour to avoid extra charges. Retry checks again and may use a credit.' };
@@ -907,7 +940,9 @@ function fetchTranscript(videoId, retryUnavailable = false) {
       if (result.transcript?.length) {
         // Cache before replying, even if the requesting panel closed or moved
         // to another video while the request was running.
-        await chrome.storage.local.set({ [key]: { transcript: result.transcript } }).catch(() => {});
+        // Keep a title saved with a replaced (non-English) transcript.
+        const title = entry?.title || null;
+        await chrome.storage.local.set({ [key]: { transcript: result.transcript, title, lang: TRANSCRIPT_LANG } }).catch(() => {});
       } else if (result.transcriptUnavailable) {
         await chrome.storage.local.set({ [key]: { unavailable: {
           error: result.error, until: Date.now() + TRANSCRIPT_UNAVAILABLE_TTL_MS
@@ -980,7 +1015,7 @@ async function doFetchTranscript(videoId) {
 
   for (let attempt = 0; ; attempt++) {
     resp = await fetch(
-      'https://api.supadata.ai/v1/youtube/transcript?videoId=' + videoId,
+      'https://api.supadata.ai/v1/youtube/transcript?videoId=' + encodeURIComponent(videoId) + '&lang=' + TRANSCRIPT_LANG,
       { headers: { 'x-api-key': supadataKey } }
     );
 
@@ -1064,6 +1099,16 @@ async function doFetchTranscript(videoId) {
     return { error: 'Transcript data was empty', transcriptUnavailable: true };
   }
 
+  // Supadata answers `lang=en` with the video's first caption track when it has
+  // no English one, and names the track it sent in `lang`. Only English is
+  // shown, so anything else counts as no transcript (and is remembered for an
+  // hour like one, since Supadata charged for it).
+  const lang = typeof data.lang === 'string' ? data.lang : '';
+  const english = lang ? isEnglishLang(lang) : await transcriptLooksEnglish(transcript);
+  if (!english) {
+    return { error: 'This video has no English transcript.', transcriptUnavailable: true };
+  }
+
   return { transcript };
 }
 
@@ -1091,7 +1136,7 @@ async function handleGetTranscript(tabId, expectedVideoId, retryUnavailable = fa
     // Null rather than a stand-in string: the panel treats any non-empty title
     // as the real one, caches it, and then ignores the actual title when it
     // arrives a moment later — so a fabricated "YouTube Video" would stick.
-    return { transcript: result.transcript, title: cleanTabTitle(tab.title), videoId };
+    return { transcript: result.transcript, title: cleanTabTitle(tab.title), videoId, lang: TRANSCRIPT_LANG };
   } catch (err) {
     return { error: err.message || 'Unknown error fetching transcript' };
   }

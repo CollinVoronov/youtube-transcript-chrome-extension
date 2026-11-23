@@ -425,3 +425,115 @@ test('duplicate simultaneous part retries launch one provider request', async ()
   finish({ summary: 'Saved' });
   await flush();
 });
+
+// English-only transcripts. Supadata falls back to the video's first caption
+// track when it has no English one, which once showed an English talk's
+// Arabic caption track.
+const ARABIC_CUES = [
+  { text: 'حسناً، أم، مجدداً اسمي هو بوتيتو. أعمل على غروك بوت في سبيس إكس.', startTime: 12 },
+  { text: 'هل يمكنني الحصول على رفع سريع للأيدي؟ كم منكم نظر يوماً إلى كود كتبه شخص آخر', startTime: 17 }
+];
+function supadataReply(w, body) {
+  const urls = [];
+  w.context.fetch = async url => {
+    w.calls.transcript++; urls.push(url);
+    return { ok: true, status: 200, json: async () => body };
+  };
+  return urls;
+}
+const GET_ONE = { type: 'GET_TRANSCRIPT', tabId: 1, videoId: 'one' };
+
+test('transcripts are requested in English and saved as English', async () => {
+  const w = worker();
+  const urls = supadataReply(w, { lang: 'en', availableLangs: ['ar', 'en'], content: [{ text: 'Hello', offset: 0 }] });
+  const result = await w.request(GET_ONE);
+  assert.equal(result.transcript[0].text, 'Hello');
+  assert.match(urls[0], /[?&]lang=en(&|$)/);
+  assert.equal(w.data['transcript:one'].lang, 'en');
+});
+
+test('a non-English reply is refused, not shown, and remembered as unavailable', async () => {
+  const w = worker();
+  supadataReply(w, { lang: 'ar', availableLangs: ['ar'], content: ARABIC_CUES.map(c => ({ text: c.text, offset: c.startTime * 1000 })) });
+  const p = panel(w);
+  await flush();
+  assert.equal(w.calls.transcript, 1);
+  assert.equal(w.calls.summary, 0);
+  assert.match(p.document.getElementById('errorMessage').textContent, /no English transcript/);
+  assert.equal(w.data['transcript:one'].transcript, undefined);
+  assert.ok(w.data['transcript:one'].unavailable.until > Date.now());
+  assert.match((await w.request(GET_ONE)).error, /no English transcript/);
+  assert.equal(w.calls.transcript, 1);
+});
+
+test('a reply with no language tag is judged by its text', async () => {
+  const w = worker();
+  supadataReply(w, { content: ARABIC_CUES.map(c => ({ text: c.text, offset: 0 })) });
+  assert.match((await w.request(GET_ONE)).error, /no English transcript/);
+});
+
+test('an old saved Arabic transcript is replaced with the English one on open', async () => {
+  const w = worker({ 'transcript:one': { transcript: ARABIC_CUES, title: 'Talk' },
+    'insights:one': { summary: 'Saved English summary.', sections: [], notableQuotes: [] } });
+  supadataReply(w, { lang: 'en', content: [{ text: 'Okay, um, again my name is Lauren.', offset: 12000 }] });
+  const p = panel(w);
+  await flush();
+  assert.equal(w.calls.transcript, 1);
+  assert.equal(vm.runInContext('currentTranscript', p.context)[0].text, 'Okay, um, again my name is Lauren.');
+  assert.equal(w.data['transcript:one'].lang, 'en');
+  assert.equal(w.data['transcript:one'].transcript[0].text, 'Okay, um, again my name is Lauren.');
+  // The saved English summary is kept; no new summary is paid for.
+  assert.equal(w.calls.summary, 0);
+});
+
+test('an old saved English transcript is kept and tagged without a new fetch', async () => {
+  const cues = [{ text: 'Welcome back to the channel. Today we are going to talk about reviewing code written by agents.', startTime: 0 }];
+  const w = worker({ 'transcript:one': { transcript: cues, title: 'Talk' } });
+  assert.equal((await w.request(GET_ONE)).transcript[0].text, cues[0].text);
+  assert.equal(w.calls.transcript, 0);
+  assert.equal(w.data['transcript:one'].lang, 'en');
+  assert.equal(w.data['transcript:one'].title, 'Talk');
+});
+
+test('a full rerun never summarizes a saved Arabic transcript', async () => {
+  const w = worker({ 'transcript:one': { transcript: ARABIC_CUES, title: 'Talk' },
+    'insights:one': { summary: 'Saved English summary.', sections: [], notableQuotes: [] } });
+  supadataReply(w, { lang: 'en', content: [{ text: 'Okay, um, again my name is Lauren.', offset: 12000 }] });
+  await w.request({ type: 'GENERATE_INSIGHTS', videoId: 'one', title: 'Talk', force: true });
+  await flush();
+  assert.equal(w.calls.transcript, 1);
+  assert.match(w.summaryRequests[0].transcript, /Lauren/);
+  assert.doesNotMatch(w.summaryRequests[0].transcript, /\p{Script=Arabic}/u);
+  assert.equal(w.data['transcript:one'].title, 'Talk');
+});
+
+test('a part rerun never summarizes a saved Arabic transcript', async () => {
+  const w = worker({ 'transcript:one': { transcript: ARABIC_CUES },
+    'insights:one': { summary: 'Saved English summary.', sections: [], notableQuotes: [] } });
+  const urls = supadataReply(w, { lang: 'en', content: [{ text: 'Okay, um, again my name is Lauren.', offset: 12000 }] });
+  const sent = [];
+  w.context.getInsightsPart = async (part, transcriptText) => { sent.push({ transcriptText, part }); return { sections: [] }; };
+  await w.request({ type: 'REGENERATE_PART', videoId: 'one', part: 'sections', title: 'Talk' });
+  await flush();
+  assert.equal(urls.filter(url => url.includes('supadata')).length, 1);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].transcriptText, /Lauren/);
+  assert.doesNotMatch(sent[0].transcriptText, /\p{Script=Arabic}/u);
+});
+
+test('Chrome language detection catches an untagged Latin-script transcript', async () => {
+  const cues = [{ text: 'Hola a todos, bienvenidos de nuevo al canal. Hoy vamos a hablar de revisar código escrito por agentes.', startTime: 0 }];
+  const w = worker({ 'transcript:one': { transcript: cues } });
+  w.chrome.i18n = { detectLanguage: (text, done) => done({ isReliable: true, languages: [{ language: 'es', percentage: 97 }] }) };
+  supadataReply(w, { lang: 'es', content: cues.map(c => ({ text: c.text, offset: 0 })) });
+  assert.match((await w.request(GET_ONE)).error, /no English transcript/);
+  assert.equal(w.calls.transcript, 1);
+});
+
+test('an unreliable language guess keeps an untagged transcript', async () => {
+  const cues = [{ text: 'Welcome back everyone, today we review agent written code and talk about slop in big codebases.', startTime: 0 }];
+  const w = worker({ 'transcript:one': { transcript: cues } });
+  w.chrome.i18n = { detectLanguage: (text, done) => done({ isReliable: false, languages: [{ language: 'nl', percentage: 70 }] }) };
+  assert.equal((await w.request(GET_ONE)).transcript[0].text, cues[0].text);
+  assert.equal(w.calls.transcript, 0);
+});

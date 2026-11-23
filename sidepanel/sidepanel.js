@@ -241,8 +241,12 @@ async function loadTranscript(expectedVideoId, titleHint, { retryUnavailable = f
 
     // 2) Transcript: serve from cache (no Supadata request → no extra credits)
     //    or fetch it once and cache it for next time.
+    //    Only a transcript saved as English is served here. Older saved
+    //    transcripts have no language tag, so the worker checks them (and
+    //    fetches English if one turns out to be another language).
     const cachedTx = videoId ? cached[STORE_PREFIX_TRANSCRIPT + videoId] : null;
-    if (cachedTx && Array.isArray(cachedTx.transcript) && cachedTx.transcript.length) {
+    if (cachedTx && Array.isArray(cachedTx.transcript) && cachedTx.transcript.length
+      && /^en(?:[-_]|$)/i.test(cachedTx.lang || '')) {
       currentTranscript = cachedTx.transcript;
       // Run the cached title through the same filter: a video cached while the
       // tab said "Watch later" would otherwise keep that name forever.
@@ -286,7 +290,7 @@ async function loadTranscript(expectedVideoId, titleHint, { retryUnavailable = f
       const cacheId = videoId || currentVideoId;
       if (cacheId) {
         chrome.storage.local
-          .set({ [STORE_PREFIX_TRANSCRIPT + cacheId]: { transcript: response.transcript, title: response.title || null } })
+          .set({ [STORE_PREFIX_TRANSCRIPT + cacheId]: { transcript: response.transcript, title: response.title || cachedTx?.title || null, lang: response.lang || null } })
           .catch(() => {});
       }
     }
