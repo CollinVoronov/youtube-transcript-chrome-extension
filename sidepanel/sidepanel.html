@@ -136,11 +136,23 @@
         <div style="margin-top: 16px;"></div>
         <label for="providerSelect">Summarize with</label>
         <select id="providerSelect">
+          <option value="openrouter">OpenRouter</option>
           <option value="cursor">My Cursor account (API key)</option>
           <option value="webhook">My Cursor automation (webhook)</option>
           <option value="anthropic">Anthropic API key</option>
         </select>
-        <p class="hint">Cursor mode calls api.cursor.com directly and bills your Cursor subscription instead of an Anthropic key. It lists whatever models your account has.</p>
+        <p class="hint">Summaries appear here as each part finishes. OpenRouter usage is billed to your OpenRouter account.</p>
+
+        <div id="openrouterSettings" style="display: none;">
+          <div style="margin-top: 16px;"></div>
+          <label for="openrouterApiKeyInput">OpenRouter API key</label>
+          <input type="password" id="openrouterApiKeyInput" placeholder="Use the configured key, or enter an override" autocomplete="off">
+          <p class="hint">Stored locally in this Chrome profile. Manage keys at <a href="https://openrouter.ai/settings/keys" target="_blank" rel="noopener noreferrer">OpenRouter</a>.</p>
+          <div style="margin-top: 16px;"></div>
+          <label for="openrouterModelInput">OpenRouter model</label>
+          <input type="text" id="openrouterModelInput" placeholder="z-ai/glm-5.3-flash" autocomplete="off">
+          <p class="hint">Default: GLM 5.3 Flash. Custom models must support JSON mode, and a zero-data-retention provider if your OpenRouter account requires one. Results are checked before they are saved.</p>
+        </div>
 
         <!-- Anthropic-key mode -->
         <div id="anthropicSettings">
@@ -182,7 +194,7 @@
           <input type="checkbox" id="autoSummarizeInput" checked>
           <span>Start summarizing as soon as I open a video</span>
         </label>
-        <p class="hint">Runs in the background the moment a YouTube video loads — no need to open this panel. A Cursor summary takes minutes, so starting it while you watch usually means it's already waiting when you check. Turn this off to only summarize when you press the button.</p>
+        <p class="hint">Fetches the transcript and starts the summary when a YouTube video opens, even with this panel closed. Saved results are reused. If no transcript is available, automatic requests for that video pause for one hour, including after browser restarts. Retry checks again immediately and may use a credit. Turn this off to wait until you open the panel.</p>
       </div>
       <div class="modal-footer">
         <button class="btn btn-secondary" id="cancelSettings">Cancel</button>

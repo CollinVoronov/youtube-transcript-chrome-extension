@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "YouTube Transcript & Insights",
-  "version": "1.1.0",
-  "description": "Extract YouTube transcripts and get an AI summary that starts generating the moment a video opens: a full section-by-section breakdown and quotes you can star and jump to.",
+  "version": "1.2.4",
+  "description": "Automatically prepare YouTube transcripts and AI summaries when videos open. Reuse saved results and pause unavailable transcript checks for one hour.",
   "permissions": [
     "activeTab",
     "scripting",
@@ -14,6 +14,7 @@
     "*://*.youtube.com/*",
     "https://api.supadata.ai/*",
     "https://api.anthropic.com/*",
+    "https://openrouter.ai/*",
     "https://api.cursor.com/*",
     "https://api2.cursor.sh/*"
   ],
