@@ -4,6 +4,12 @@ An unpacked Chrome extension that fetches timestamped YouTube transcripts and
 shows summaries, action items, and sections in a side panel. Sections open automatically at
 the top, followed by Summary and the separate What to do group.
 
+Transcripts are English only. Supadata is asked for `lang=en`; when a video
+has no English captions it sends another track instead, and the panel shows
+"This video has no English transcript." That result is saved for a week (other
+unavailable results for an hour), and Retry checks again. Transcripts saved
+before this rule are checked once and replaced if they aren't English.
+
 ## OpenRouter
 
 Reload the extension in Chrome after updating these files. In the extension's

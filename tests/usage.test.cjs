@@ -466,6 +466,24 @@ test('a non-English reply is refused, not shown, and remembered as unavailable',
   assert.equal(w.calls.transcript, 1);
 });
 
+test('no English transcript is remembered for a week', async () => {
+  const w = worker();
+  supadataReply(w, { lang: 'ar', content: ARABIC_CUES.map(c => ({ text: c.text, offset: 0 })) });
+  await w.request(GET_ONE);
+  const saved = w.data['transcript:one'].unavailable;
+  assert.equal(saved.noEnglish, true);
+  assert.ok(saved.until > Date.now() + 6 * 24 * 60 * 60 * 1000);
+  const restarted = worker({ 'transcript:one': { unavailable: { ...saved, until: Date.now() + 2 * 60 * 60 * 1000 } } });
+  assert.match((await restarted.request(GET_ONE)).error, /saved for a week/);
+  assert.equal(restarted.calls.transcript, 0);
+});
+
+test('regional English tags are accepted', async () => {
+  const w = worker();
+  supadataReply(w, { lang: 'en-US', content: [{ text: 'Hello there', offset: 0 }] });
+  assert.equal((await w.request(GET_ONE)).transcript[0].text, 'Hello there');
+});
+
 test('a reply with no language tag is judged by its text', async () => {
   const w = worker();
   supadataReply(w, { content: ARABIC_CUES.map(c => ({ text: c.text, offset: 0 })) });

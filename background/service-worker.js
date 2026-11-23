@@ -883,6 +883,10 @@ const inFlightTranscripts = new Map();
 // Supadata charges for HTTP 206 too. Reopening an unavailable video must not
 // spend another credit each time; the panel's Retry button bypasses this.
 const TRANSCRIPT_UNAVAILABLE_TTL_MS = 60 * 60 * 1000;
+// A video's caption languages rarely change, so "no English transcript" is
+// kept longer. With an hour, an open tab on a non-English video paid for the
+// same refused reply every hour through automatic preparation.
+const NO_ENGLISH_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 // Transcripts are English only. Saved transcripts carry `lang` from this
 // change on; older ones (and replies without `lang`) are judged by their text.
@@ -933,7 +937,8 @@ function fetchTranscript(videoId, retryUnavailable = false) {
       }
       const unavailable = stored[key]?.unavailable;
       if (!retryUnavailable && unavailable?.until > Date.now()) {
-        return { error: unavailable.error + ' This result is saved for one hour to avoid extra charges. Retry checks again and may use a credit.' };
+        const saved = unavailable.noEnglish ? 'for a week' : 'for one hour';
+        return { error: unavailable.error + ` This result is saved ${saved} to avoid extra charges. Retry checks again and may use a credit.` };
       }
 
       const result = await doFetchTranscript(videoId);
@@ -945,7 +950,9 @@ function fetchTranscript(videoId, retryUnavailable = false) {
         await chrome.storage.local.set({ [key]: { transcript: result.transcript, title, lang: TRANSCRIPT_LANG } }).catch(() => {});
       } else if (result.transcriptUnavailable) {
         await chrome.storage.local.set({ [key]: { unavailable: {
-          error: result.error, until: Date.now() + TRANSCRIPT_UNAVAILABLE_TTL_MS
+          error: result.error,
+          until: Date.now() + (result.noEnglish ? NO_ENGLISH_TTL_MS : TRANSCRIPT_UNAVAILABLE_TTL_MS),
+          ...(result.noEnglish ? { noEnglish: true } : {})
         } } }).catch(() => {});
       }
       return result;
@@ -1101,12 +1108,12 @@ async function doFetchTranscript(videoId) {
 
   // Supadata answers `lang=en` with the video's first caption track when it has
   // no English one, and names the track it sent in `lang`. Only English is
-  // shown, so anything else counts as no transcript (and is remembered for an
-  // hour like one, since Supadata charged for it).
+  // shown, so anything else counts as no transcript (remembered for a week,
+  // since Supadata charged for it and caption languages rarely change).
   const lang = typeof data.lang === 'string' ? data.lang : '';
   const english = lang ? isEnglishLang(lang) : await transcriptLooksEnglish(transcript);
   if (!english) {
-    return { error: 'This video has no English transcript.', transcriptUnavailable: true };
+    return { error: 'This video has no English transcript.', transcriptUnavailable: true, noEnglish: true };
   }
 
   return { transcript };
