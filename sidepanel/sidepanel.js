@@ -10,6 +10,8 @@ let currentModel = 'claude-sonnet-4-6';
 let provider = 'cursor';      // 'cursor' (direct API) | 'webhook' (Cursor automation) | 'anthropic'
 let cursorModel = '';         // a Cursor model spec; the list is fetched live
 let cursorKeyOverride = '';   // optional; blank means use CURSOR_API_KEY from lib/config.js
+let openrouterKeyOverride = '';
+let openrouterModel = '';
 let currentInsights = null;   // parsed summary object for the current video
 let starred = {};             // { "<kind>:<index>": true } for the current video
 let showStarredOnly = false;
@@ -58,6 +60,10 @@ function activeCursorKey() {
   return cursorKeyOverride || (typeof CURSOR_API_KEY === 'string' ? CURSOR_API_KEY : '');
 }
 
+function activeOpenrouterKey() {
+  return openrouterKeyOverride || (typeof OPENROUTER_API_KEY === 'string' ? OPENROUTER_API_KEY : '');
+}
+
 // The baseline Cursor model, also from lib/config.js.
 function defaultCursorModel() {
   return (typeof CURSOR_DEFAULT_MODEL === 'string' && CURSOR_DEFAULT_MODEL) || 'auto';
@@ -67,18 +73,21 @@ function defaultCursorModel() {
 async function init() {
   // Load API keys and preferences
   const stored = await chrome.storage.local.get([
-    'apiKey', 'supadataKey', 'model', 'provider', 'cursorModel', 'cursorApiKey'
+    'apiKey', 'supadataKey', 'model', 'provider', 'cursorModel', 'cursorApiKey',
+    'openrouterApiKey', 'openrouterModel'
   ]);
   apiKey = stored.apiKey || '';
   currentModel = stored.model || 'claude-sonnet-4-6';
-  provider = ['anthropic', 'webhook'].includes(stored.provider) ? stored.provider : 'cursor';
+  provider = ['cursor', 'anthropic', 'webhook', 'openrouter'].includes(stored.provider) ? stored.provider
+    : (typeof DEFAULT_INSIGHTS_PROVIDER === 'string' ? DEFAULT_INSIGHTS_PROVIDER : 'cursor');
+  openrouterKeyOverride = stored.openrouterApiKey || '';
+  openrouterModel = openrouterModelSetting(stored.openrouterModel);
   cursorModel = stored.cursorModel || defaultCursorModel();
   cursorKeyOverride = stored.cursorApiKey || '';
 
   // Seed the built-in Supadata key on first run. The value lives in the
-  // gitignored lib/config.js rather than inline here — the same seeding also
-  // runs in the service worker, so a background prep works before this panel has
-  // ever been opened.
+  // gitignored lib/config.js rather than inline here. The worker can also read
+  // that built-in key directly.
   if (!stored.supadataKey && typeof SUPADATA_API_KEY === 'string' && SUPADATA_API_KEY) {
     await chrome.storage.local.set({ supadataKey: SUPADATA_API_KEY });
   }
@@ -99,7 +108,8 @@ async function init() {
 // Point the panel at whatever YouTube video is in THIS window's active tab.
 // This is the single source of truth for which video the panel shows; tab
 // switches, navigations, and video changes all funnel through here.
-async function syncToActiveTab() {
+async function syncToActiveTab({ refresh = false } = {}) {
+  if (document.visibilityState === 'hidden') return;
   let tab = null;
   try {
     const query = myWindowId != null
@@ -111,6 +121,7 @@ async function syncToActiveTab() {
     tab = null;
   }
 
+  if (document.visibilityState === 'hidden') return;
   const url = tab?.url || '';
   const isWatch = url.includes('youtube.com/watch');
   let videoId = null;
@@ -121,7 +132,7 @@ async function syncToActiveTab() {
   if (isWatch && videoId) {
     // Only (re)load when the tab or the video actually changed, so focusing the
     // window or re-activating the same tab doesn't trigger a needless refetch.
-    if (tab.id !== currentTabId || videoId !== currentVideoId) {
+    if (refresh || tab.id !== currentTabId || videoId !== currentVideoId) {
       currentTabId = tab.id;
       loadTranscript(videoId, cleanTitle(tab.title));
     }
@@ -160,7 +171,8 @@ function cleanTitle(title) {
 // title, set immediately so the header never lags behind the active video.
 // Results that arrive after the user has moved on (different tab or newer
 // load) are discarded.
-async function loadTranscript(expectedVideoId, titleHint) {
+async function loadTranscript(expectedVideoId, titleHint, { retryUnavailable = false } = {}) {
+  if (document.visibilityState === 'hidden') return;
   // The video we are leaving may still have a scroll position waiting on the
   // debounce. Get it down before currentVideoId moves on, and stop recording
   // until the new video's view has been restored.
@@ -198,13 +210,15 @@ async function loadTranscript(expectedVideoId, titleHint) {
   setTranscriptOpen(false);
 
   // True only while this load is still the one the panel cares about.
-  const isCurrent = () => seq === loadSeq && reqTabId === currentTabId;
+  const isCurrent = () => seq === loadSeq && reqTabId === currentTabId
+    && document.visibilityState !== 'hidden';
 
   try {
     // 1) One fast local read for everything we cache about this video. This
     //    runs before any network call, so a previously-seen video appears
     //    almost instantly instead of waiting on the transcript fetch.
     let cached = {};
+    let languageRepairNeeded = false;
     if (videoId) {
       cached = await chrome.storage.local.get([
         STORE_PREFIX_TRANSCRIPT + videoId,
@@ -213,6 +227,10 @@ async function loadTranscript(expectedVideoId, titleHint) {
         STORE_PREFIX_VIEW + videoId
       ]);
       if (!isCurrent()) return;
+      const english = await prepareEnglishInsights(cached[STORE_PREFIX_INSIGHTS + videoId]);
+      if (!isCurrent()) return;
+      cached[STORE_PREFIX_INSIGHTS + videoId] = english.insights;
+      languageRepairNeeded = english.parts.length > 0;
     }
 
     // How this video was left. The transcript half is applied now, before the
@@ -223,8 +241,12 @@ async function loadTranscript(expectedVideoId, titleHint) {
 
     // 2) Transcript: serve from cache (no Supadata request → no extra credits)
     //    or fetch it once and cache it for next time.
+    //    Only a transcript saved as English is served here. Older saved
+    //    transcripts have no language tag, so the worker checks them (and
+    //    fetches English if one turns out to be another language).
     const cachedTx = videoId ? cached[STORE_PREFIX_TRANSCRIPT + videoId] : null;
-    if (cachedTx && Array.isArray(cachedTx.transcript) && cachedTx.transcript.length) {
+    if (cachedTx && Array.isArray(cachedTx.transcript) && cachedTx.transcript.length
+      && /^en(?:[-_]|$)/i.test(cachedTx.lang || '')) {
       currentTranscript = cachedTx.transcript;
       // Run the cached title through the same filter: a video cached while the
       // tab said "Watch later" would otherwise keep that name forever.
@@ -234,7 +256,8 @@ async function loadTranscript(expectedVideoId, titleHint) {
       const response = await chrome.runtime.sendMessage({
         type: 'GET_TRANSCRIPT',
         tabId: reqTabId,
-        videoId
+        videoId,
+        retryUnavailable
       });
       if (!isCurrent()) return;
 
@@ -267,7 +290,7 @@ async function loadTranscript(expectedVideoId, titleHint) {
       const cacheId = videoId || currentVideoId;
       if (cacheId) {
         chrome.storage.local
-          .set({ [STORE_PREFIX_TRANSCRIPT + cacheId]: { transcript: response.transcript, title: response.title || null } })
+          .set({ [STORE_PREFIX_TRANSCRIPT + cacheId]: { transcript: response.transcript, title: response.title || cachedTx?.title || null, lang: response.lang || null } })
           .catch(() => {});
       }
     }
@@ -277,8 +300,8 @@ async function loadTranscript(expectedVideoId, titleHint) {
 
     // 3) Summary: render the cached one (no model request → no extra credits),
     //    else attach to a run the worker already has going for this video, else
-    //    start one. Asking the worker first is what stops a panel opened during
-    //    a background prep from kicking off a second paid run for the same video.
+    //    start one. Reopening during an existing run attaches to it instead
+    //    of paying for another summary.
     const hadCachedSummary = applyCachedInsights(cached, videoId, savedView);
     if (!isCurrent()) return;
 
@@ -302,7 +325,7 @@ async function loadTranscript(expectedVideoId, titleHint) {
       for (const part of status.parts) pending[`${part}Pending`] = true;
       currentInsights = { ...currentInsights, ...pending };
       renderInsights();
-    } else if (!hadCachedSummary && canSummarize()) {
+    } else if ((!hadCachedSummary || languageRepairNeeded) && canSummarize()) {
       generateInsights();
     }
 
@@ -333,8 +356,10 @@ function resetToEmpty() {
 function resetInsightsUI() {
   currentInsights = null;
   awaitingSummary = false;
-  // A new video starts collapsed, like a fresh panel.
+  // Open the section index and summary immediately on each video.
   openGroups.clear();
+  openGroups.add('sections');
+  openGroups.add('summary');
   summaryExpanded = false;
   starred = {};
   showStarredOnly = false;
@@ -414,7 +439,8 @@ function setTranscriptOpen(open) {
 function applyTranscriptViewState(view) {
   setTranscriptView(!view?.plainText);
   setTranscriptOpen(!!view?.transcriptOpen);
-  insightsContainer.classList.toggle('insights-collapsed', !!view?.insightsCollapsed);
+  // Always reveal the sections on load, including views saved while collapsed.
+  insightsContainer.classList.remove('insights-collapsed');
 }
 
 // The summary half. Runs after resetInsightsUI has cleared these back to their
@@ -423,6 +449,8 @@ function applyTranscriptViewState(view) {
 function applyInsightsViewState(view) {
   openGroups.clear();
   if (Array.isArray(view?.groups)) for (const key of view.groups) openGroups.add(key);
+  openGroups.add('sections');
+  openGroups.add('summary');
   summaryExpanded = !!view?.summaryExpanded;
   showStarredOnly = !!view?.starredOnly;
   document.getElementById('starFilterBtn')?.classList.toggle('active', showStarredOnly);
@@ -591,6 +619,7 @@ function applyCachedInsights(cached, videoId, savedView) {
 }
 
 function canSummarize() {
+  if (provider === 'openrouter') return !!activeOpenrouterKey();
   if (provider === 'anthropic') return !!apiKey;
   // Webhook mode needs the automation credentials AND a Cursor key, because the
   // webhook token can only trigger the run — reading it back needs the API key.
@@ -614,15 +643,17 @@ function showInsightsPending(message) {
     lastGoodInsights = currentInsights;
     lastGoodStarred = { ...starred };
   }
-  // Drop whatever the last run produced. A new run replaces all three parts, so
+  // Drop whatever the last run produced. A new run replaces both parts, so
   // leaving the old ones on screen showed a previous run's sections and
-  // takeaways sitting under a "Writing the summary…" row — stale content
+  // action items sitting under a "Writing the summary…" row — stale content
   // wearing a fresh run's clothes, with no way to tell which was which.
   // (A single-part rerun does NOT come through here: it keeps the other parts
   // deliberately, and marks only its own as pending.)
   currentInsights = null;
   starred = {};
   summaryExpanded = false;
+  openGroups.add('sections');
+  openGroups.add('summary');
   insightsContainer.style.display = 'block';
   insightsContainer.classList.remove('insights-collapsed');
   insightsLoading.style.display = 'flex';
@@ -631,7 +662,7 @@ function showInsightsPending(message) {
   }
   const btn = document.getElementById('insightsBtn');
   if (btn) btn.disabled = true;
-  // Draw the three group headers straight away, each saying it hasn't loaded
+  // Draw the group headers straight away, each saying it hasn't loaded
   // yet. The parts finish at very different times, and groups appearing one by
   // one made the panel jump under the reader — now the shape is fixed from the
   // first second and only the contents fill in.
@@ -644,7 +675,9 @@ function showInsightsError(message) {
   const btn = document.getElementById('insightsBtn');
   if (btn) btn.disabled = false;
 
-  const text = message === 'NO_API_KEY'
+  const text = message === 'NO_OPENROUTER_KEY'
+    ? 'Add your OpenRouter API key in Settings, then press Summarize again.'
+    : message === 'NO_API_KEY'
     ? 'No Anthropic API key. Add one in Settings, then press Summarize again.'
     : message === 'NO_CURSOR_KEY'
       ? 'No Cursor API key. Paste one into CURSOR_API_KEY in lib/config.js, then reload the extension.'
@@ -667,7 +700,7 @@ function showInsightsError(message) {
   }
 
   // Nothing to fall back to: replace the pending placeholders with the reason.
-  // (This clear is also what stops NO_API_KEY leaving three groups saying they
+  // (This clear is also what stops NO_API_KEY leaving groups saying they
   // are still generating when no run exists at all.)
   currentInsights = null;
   insightsContent.innerHTML = '';
@@ -712,7 +745,7 @@ function applyInsights(insights) {
 /**
  * Paint what has arrived so far while the remaining parts are still generating.
  *
- * Summary, sections and quotes are three separate runs and finish at very
+ * Summary and sections are two separate runs and finish at very
  * different times, so this is called once per part that lands early. Showing
  * each as it arrives is the whole reason for the split — the reader gets the
  * summary at the point they used to still be watching a spinner. Groups that
@@ -744,17 +777,19 @@ function applyPartialInsights(partial) {
 /**
  * Ask the worker to summarize. The run itself lives in the service worker, so it
  * survives this panel being closed and the user switching tabs or windows — and
- * because the worker dedups by videoId, clicking this while a background prep is
- * already running attaches to that run instead of paying for a second one.
+ * the worker dedups by videoId. Reopening during a run attaches to it instead
+ * of paying for a second one.
  *
  * Results arrive via the INSIGHTS_* broadcast below, not as the reply here.
  */
 async function generateInsights({ force = false } = {}) {
-  if (!currentTranscript) return;
+  if (!currentTranscript || document.visibilityState === 'hidden') return;
 
   if (!canSummarize()) {
     showToast(
-      provider === 'anthropic'
+      provider === 'openrouter'
+        ? 'Add your OpenRouter API key in Settings to summarize'
+        : provider === 'anthropic'
         ? 'Add your Anthropic API key in Settings to summarize'
         : provider === 'webhook'
           ? 'Set CURSOR_WEBHOOK_URL, CURSOR_WEBHOOK_AUTH and CURSOR_API_KEY in lib/config.js'
@@ -775,7 +810,7 @@ async function generateInsights({ force = false } = {}) {
       transcript: currentTranscript,
       title: videoTitle.textContent || 'this video',
       // Only an explicit press regenerates; the automatic path takes whatever a
-      // background prep already produced.
+      // previous panel request already produced.
       force
     });
 
@@ -783,7 +818,7 @@ async function generateInsights({ force = false } = {}) {
     if (res?.error) {
       showInsightsError(res.error);
     } else if (res?.insights) {
-      // A background prep finished between our cache read and this call.
+      // A previous panel request finished between our cache read and this call.
       applyInsights(normalizeInsights(res.insights));
     } else {
       if (res?.progress && insightsLoadingText) insightsLoadingText.textContent = res.progress;
@@ -879,7 +914,8 @@ chrome.runtime.onMessage.addListener((message) => {
 
   if (message.type === 'INSIGHTS_DONE') {
     applyInsights(normalizeInsights(message.insights));
-    showToast('Summary ready', 'success');
+    const failed = ['summary', 'sections'].filter(part => message.insights?.[`${part}Error`]);
+    showToast(failed.length ? `Finished; retry ${failed.join(' and ')}` : 'Summary ready', failed.length ? 'error' : 'success');
     return;
   }
 
@@ -913,11 +949,18 @@ chrome.runtime.onMessage.addListener((message) => {
   if (message.type === 'PART_DONE') {
     // The worker already dropped the stars belonging to the regenerated part;
     // mirror that here so the panel doesn't keep stars pointing at gone items.
-    const kinds = { sections: ['section'], quotes: ['quote'], summary: ['takeaway', 'action'] }[message.part] || [];
+    const kinds = { sections: ['section'], summary: ['action'] }[message.part] || [];
     for (const id of Object.keys(starred)) {
       if (kinds.some(kind => id.startsWith(`${kind}:`))) delete starred[id];
     }
-    currentInsights = normalizeInsights(message.insights);
+    const pending = {};
+    for (const part of ['summary', 'sections']) {
+      if (part !== message.part && currentInsights?.[`${part}Pending`]) {
+        pending[`${part}Pending`] = true;
+        pending[`${part}Progress`] = currentInsights[`${part}Progress`];
+      }
+    }
+    currentInsights = { ...normalizeInsights(message.insights), ...pending };
     renderInsights();
     showToast(`${PART_LABELS[message.part]} regenerated`, 'success');
     return;
@@ -954,12 +997,12 @@ function isAdSection(s) {
   return s.isAd === true || s.kind === 'ad' || s.type === 'ad';
 }
 
-// Build one interactive card (section, insight, or quote).
+// Build one interactive card (section, action, or legacy insight).
 //
 // `ad` renders the row as a skippable sponsor read; `skipTo` is the next
 // section's start time, i.e. where the ad ends, so the skip button lands the
 // viewer on the first frame of real content again.
-function buildCard({ id, timestamp, badge, title, desc, quote, ad, skipTo }) {
+function buildCard({ id, timestamp, badge, title, desc, ad, skipTo }) {
   const hasTs = typeof timestamp === 'number' && !isNaN(timestamp);
 
   const card = document.createElement('div');
@@ -1006,12 +1049,7 @@ function buildCard({ id, timestamp, badge, title, desc, quote, ad, skipTo }) {
 
   main.appendChild(titleRow);
 
-  if (quote) {
-    const q = document.createElement('div');
-    q.className = 'item-quote';
-    q.textContent = `“${quote}”`;
-    main.appendChild(q);
-  } else if (desc) {
+  if (desc) {
     const d = document.createElement('div');
     d.className = 'item-desc';
     d.textContent = desc;
@@ -1049,12 +1087,11 @@ function buildCard({ id, timestamp, badge, title, desc, quote, ad, skipTo }) {
   return card;
 }
 
-const PART_LABELS = { summary: 'summary', sections: 'sections', quotes: 'quotes' };
+const PART_LABELS = { summary: 'summary', sections: 'sections' };
 
-// Which groups are open. Everything starts collapsed — the panel is a set of
-// answers you go to, not a wall you scroll past — and this survives the
-// re-renders that a part landing or a star toggle triggers.
-const openGroups = new Set();
+// Sections and Summary open immediately; each group retains its own state
+// across partial results, star toggles, and other renders.
+const openGroups = new Set(['sections', 'summary']);
 
 // Whether the reader asked to see the full summary text. The prompt caps the
 // summary's length, but a model that overshoots must not be able to turn the
@@ -1070,13 +1107,15 @@ function toggleGroup(key) {
 }
 
 // The ↻ next to a group heading. Rerunning one part is cheap — one small run —
-// where the Summarize button re-pays for all three and throws two good ones
+// where the Summarize button re-pays for both parts and throws a good one
 // away, so each part gets its own control.
 function buildRerunButton(part) {
   const btn = document.createElement('button');
   btn.className = 'rerun-btn';
   btn.textContent = '\u21bb';
-  btn.title = `Regenerate the ${PART_LABELS[part]} only`;
+  btn.title = part === 'summary'
+    ? 'Regenerate the summary and action items'
+    : `Regenerate the ${PART_LABELS[part]} only`;
   btn.setAttribute('aria-label', `Regenerate the ${PART_LABELS[part]}`);
   btn.addEventListener('click', (e) => {
     // The heading row toggles the group; the button must not do both.
@@ -1180,9 +1219,7 @@ function partStatusRow({ pending, pendingText, error }) {
 
 // Render the current insights object into the panel.
 //
-// Order is deliberate: Sections first (the index you navigate with), then
-// Summary (the long read, with its takeaways), then Quotes. Each is collapsed
-// until opened, so the panel opens as three lines rather than a wall of text.
+// Put the section index first, followed by Summary and What to do.
 function renderInsights() {
   // Runs before anything has arrived too, so the groups exist from the start.
   if (!currentInsights && !awaitingSummary) return;
@@ -1201,11 +1238,10 @@ function renderInsights() {
   // simply has not arrived yet.
   const HAS_LANDED = {
     sections: d => Array.isArray(d.sections) || Array.isArray(d.keySections),
-    summary: d => typeof d.summary === 'string' && d.summary.length > 0,
-    quotes: d => Array.isArray(d.notableQuotes)
+    summary: d => typeof d.summary === 'string' && d.summary.length > 0
   };
   const isPending = part =>
-    data[`${part}Pending`] === true || (awaitingSummary && !HAS_LANDED[part](data));
+    data[`${part}Pending`] === true || (awaitingSummary && !data[`${part}Error`] && !HAS_LANDED[part](data));
 
   // ---- Sections: the navigation index ----
   // `sections` is the chapter-by-chapter breakdown; `keySections` is the old
@@ -1237,7 +1273,7 @@ function renderInsights() {
     error: data.sectionsError
   });
   const sectionBody = sectionStatus ? [sectionStatus, ...sectionCards] : sectionCards;
-  // Always drawn, even empty: the reader should see the same three groups from
+  // Always drawn, even empty: the reader should see the same groups from
   // the first second, filling in rather than appearing. The exception is the
   // starred view, where an empty group means "nothing starred here" — saying
   // "No sections were returned" there would be plainly false.
@@ -1252,7 +1288,7 @@ function renderInsights() {
     }));
   }
 
-  // ---- Summary: the long read, plus the takeaways from the same run ----
+  // ---- Summary ----
   const summaryPending = isPending('summary');
   const summaryBody = [];
   if (showAll && !summaryPending && (data.tldr || data.summary)) {
@@ -1293,35 +1329,6 @@ function renderInsights() {
     summaryBody.push(block);
   }
 
-  // Key takeaways come from the summary run, so they live under it.
-  const takeawayCards = summaryPending ? [] : (data.keyTakeaways || []).map((t, i) => {
-    const id = itemId('takeaway', i);
-    return include(id)
-      ? buildCard({ id, timestamp: t.timestamp, title: t.point, desc: t.detail })
-      : null;
-  }).filter(Boolean);
-  if (takeawayCards.length) {
-    const label = document.createElement('h4');
-    label.className = 'subgroup-label';
-    label.textContent = 'Key takeaways';
-    summaryBody.push(label, ...takeawayCards);
-  }
-
-  // What to actually do about it — the practical residue of the video, from
-  // the same run as the summary.
-  const actionCards = summaryPending ? [] : (data.actionItems || []).map((a, i) => {
-    const id = itemId('action', i);
-    return include(id)
-      ? buildCard({ id, timestamp: a.timestamp, title: a.action, desc: a.detail })
-      : null;
-  }).filter(Boolean);
-  if (actionCards.length) {
-    const label = document.createElement('h4');
-    label.className = 'subgroup-label';
-    label.textContent = 'What to do';
-    summaryBody.push(label, ...actionCards);
-  }
-
   // Legacy field from summaries cached before it was dropped.
   const insightCards = (data.keyInsights || []).map((it, i) => {
     const id = itemId('insight', i);
@@ -1342,9 +1349,32 @@ function renderInsights() {
       key: 'summary',
       heading: 'Summary',
       part: 'summary',
-      count: summaryPending ? null : ((takeawayCards.length + actionCards.length) || null),
       pending: summaryPending,
       body: summaryBody.length ? summaryBody : [emptyRow('No summary was returned.')]
+    }));
+  }
+
+  // What to actually do about it — the practical residue of the video, from
+  // the same run as the summary.
+  const actionCards = summaryPending ? [] : (data.actionItems || []).map((a, i) => {
+    const id = itemId('action', i);
+    return include(id)
+      ? buildCard({ id, timestamp: a.timestamp, title: a.action, desc: a.detail })
+      : null;
+  }).filter(Boolean);
+  const actionStatus = partStatusRow({
+    pending: summaryPending,
+    pendingText: 'Finding action items…',
+    error: data.summaryError
+  });
+  const actionBody = actionStatus ? [actionStatus, ...actionCards] : actionCards;
+  if (showAll || actionCards.length) {
+    insightsContent.appendChild(buildCollapsibleGroup({
+      key: 'actions',
+      heading: 'What to do',
+      count: summaryPending ? null : (actionCards.length || null),
+      pending: summaryPending,
+      body: actionBody.length ? actionBody : [emptyRow('No action items were recommended in this video.')]
     }));
   }
 
@@ -1355,29 +1385,6 @@ function renderInsights() {
   if (summaryText && showMore) {
     const clipped = summaryText.scrollHeight > summaryText.clientHeight + 4;
     showMore.style.display = (clipped || summaryExpanded) ? 'inline-block' : 'none';
-  }
-
-  // ---- Quotes ----
-  const quotesPending = isPending('quotes');
-  const quoteCards = quotesPending ? [] : (data.notableQuotes || []).map((q, i) => {
-    const id = itemId('quote', i);
-    return include(id) ? buildCard({ id, timestamp: q.timestamp, quote: q.quote }) : null;
-  }).filter(Boolean);
-  const quoteStatus = partStatusRow({
-    pending: quotesPending,
-    pendingText: data.quotesProgress || 'Pulling the quotes…',
-    error: data.quotesError
-  });
-  const quoteBody = quoteStatus ? [quoteStatus, ...quoteCards] : quoteCards;
-  if (showAll || quoteCards.length) {
-    insightsContent.appendChild(buildCollapsibleGroup({
-      key: 'quotes',
-      heading: 'Notable Quotes',
-      part: 'quotes',
-      count: quotesPending ? null : (quoteCards.length || null),
-      pending: quotesPending,
-      body: quoteBody.length ? quoteBody : [emptyRow('No quotes were pulled from this transcript.')]
-    }));
   }
 
   if (showStarredOnly && !insightsContent.querySelector('.item-card')) {
@@ -1453,7 +1460,14 @@ document.getElementById('starFilterBtn').addEventListener('click', (e) => {
 // visibilitychange lands first and is enough to get the last position written.
 window.addEventListener('scroll', () => saveViewState(), { passive: true });
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') flushViewState();
+  if (document.visibilityState === 'hidden') {
+    flushViewState();
+    ++loadSeq; // A pending transcript response must not start AI while hidden.
+  } else {
+    // Chrome may retain a hidden panel document. Reopen from cache or attach
+    // to work already running, and only now request anything missing.
+    syncToActiveTab({ refresh: true });
+  }
 });
 window.addEventListener('pagehide', flushViewState);
 
@@ -1472,6 +1486,7 @@ function syncProviderFields() {
   const usesCursor = v === 'cursor' || v === 'webhook';
   document.getElementById('anthropicSettings').style.display = v === 'anthropic' ? 'block' : 'none';
   document.getElementById('cursorSettings').style.display = usesCursor ? 'block' : 'none';
+  document.getElementById('openrouterSettings').style.display = v === 'openrouter' ? 'block' : 'none';
 
   const modelRow = document.getElementById('cursorModelRow');
   if (modelRow) modelRow.style.display = v === 'webhook' ? 'none' : 'block';
@@ -1540,10 +1555,11 @@ async function loadCursorModels({ silent } = {}) {
 document.getElementById('settingsBtn').addEventListener('click', async () => {
   const stored = await chrome.storage.local.get(['supadataKey', 'autoSummarize']);
   document.getElementById('supadataKeyInput').value = stored.supadataKey || '';
-  // Absent means on — matches the worker's `!== false` default.
   document.getElementById('autoSummarizeInput').checked = stored.autoSummarize !== false;
   apiKeyInput.value = apiKey;
   cursorApiKeyInput.value = cursorKeyOverride;
+  document.getElementById('openrouterApiKeyInput').value = openrouterKeyOverride;
+  document.getElementById('openrouterModelInput').value = openrouterModel;
   document.getElementById('modelSelect').value = currentModel;
   providerSelect.value = provider;
   syncProviderFields();
@@ -1577,13 +1593,16 @@ document.getElementById('saveSettings').addEventListener('click', async () => {
   apiKey = apiKeyInput.value.trim();
   const supadataKey = document.getElementById('supadataKeyInput').value.trim();
   currentModel = document.getElementById('modelSelect').value;
-  provider = ['anthropic', 'webhook'].includes(providerSelect.value) ? providerSelect.value : 'cursor';
+  provider = ['anthropic', 'webhook', 'openrouter'].includes(providerSelect.value) ? providerSelect.value : 'cursor';
+  openrouterKeyOverride = document.getElementById('openrouterApiKeyInput').value.trim();
+  openrouterModel = openrouterModelSetting(document.getElementById('openrouterModelInput').value);
   cursorModel = cursorModelSelect.value || defaultCursorModel();
   cursorKeyOverride = cursorApiKeyInput.value.trim();
   const autoSummarize = document.getElementById('autoSummarizeInput').checked;
   await chrome.storage.local.set({
     apiKey, supadataKey, model: currentModel, provider, cursorModel,
-    cursorApiKey: cursorKeyOverride, autoSummarize
+    cursorApiKey: cursorKeyOverride, autoSummarize,
+    openrouterApiKey: openrouterKeyOverride, openrouterModel
   });
   settingsModal.style.display = 'none';
   showToast('Settings saved!', 'success');
@@ -1605,7 +1624,7 @@ settingsModal.addEventListener('click', (e) => {
 // Retry — reload the current video's transcript. If the tab has since navigated
 // away, loadTranscript's stale path re-resolves the active tab.
 document.getElementById('retryBtn').addEventListener('click', () => {
-  loadTranscript(currentVideoId);
+  loadTranscript(currentVideoId, null, { retryUnavailable: true });
 });
 
 // Listen for in-page (SPA) video changes reported by the content script.

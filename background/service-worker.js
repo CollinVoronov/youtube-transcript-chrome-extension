@@ -22,7 +22,7 @@ chrome.sidePanel
 // Message routing
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'GET_TRANSCRIPT') {
-    handleGetTranscript(message.tabId || sender.tab?.id, message.videoId).then(sendResponse);
+    handleGetTranscript(message.tabId || sender.tab?.id, message.videoId, message.retryUnavailable === true).then(sendResponse);
     return true; // async response
   }
 
@@ -43,10 +43,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       tabId: sender.tab?.id
     }).catch(() => {});
 
-    // Start the transcript + summary now, while the user is still watching,
-    // instead of when they eventually open the panel. content.js sends this on
-    // every video whether or not the panel is open, so this is what makes the
-    // work happen without the extension being open at all.
+    // Start immediately even with the panel closed. fetchTranscript reuses
+    // saved results and enforces the cooldown for unavailable transcripts.
     prepareVideo(message.videoId, message.title).catch(() => {});
   }
 
@@ -57,7 +55,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  // Redo one part (summary / sections / quotes) of an existing summary,
+  // Redo one part (summary / sections) of an existing summary,
   // leaving the other two exactly as they are.
   if (message.type === 'REGENERATE_PART') {
     handleRegeneratePart(message).then(sendResponse);
@@ -85,20 +83,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 // ---------------------------------------------------- Background summarization
 //
-// Generation lives here rather than in the side panel for two reasons:
-//
-//  1. The panel is a per-window document. Switching tabs re-points it at
-//     whatever the new active tab shows, and closing it destroys the document
-//     outright — so work started there was abandoned, and on return the panel
-//     found nothing cached and started a *second* paid run for the same video.
-//  2. A Cursor cloud agent provisions a VM before it emits a token, so a run
-//     takes minutes. Starting when the panel opens means the user watches a
-//     spinner for all of it. Starting when the video opens means it elapses
-//     while they watch the video, and the summary is usually already cached by
-//     the time they look at the panel.
-//
-// Everything is keyed by videoId and deduped through inFlightInsights, so the
-// panel and a background prep can never both be paying for the same summary.
+// Videos start preparing as soon as they open. Runs live here so closing the
+// panel does not abandon a summary or pay for it again on reopen.
+// Everything is keyed by videoId and deduped through inFlightInsights.
 
 const STORE_PREFIX_INSIGHTS = 'insights:';
 const STORE_PREFIX_STARRED = 'starred:';
@@ -120,9 +107,7 @@ function broadcast(message) {
 }
 
 // Timings printed to the worker console (chrome://extensions → this extension →
-// "service worker"). This is how you tell the two failure modes apart: whether a
-// summary felt slow because pre-generation never started, or because the run
-// itself genuinely takes minutes. Guessing between those wastes a lot of time.
+// "service worker"). Track how long user-requested summary runs take.
 function logPrep(...args) {
   console.log('[yt-insights]', ...args);
 }
@@ -131,10 +116,14 @@ function logPrep(...args) {
 // Settings wins, and clearing it falls back to the one baked into lib/config.js.
 async function readSummarySettings() {
   const stored = await chrome.storage.local.get([
-    'apiKey', 'model', 'provider', 'cursorModel', 'cursorApiKey', 'autoSummarize'
+    'apiKey', 'model', 'provider', 'cursorModel', 'cursorApiKey', 'autoSummarize',
+    'openrouterApiKey', 'openrouterModel'
   ]);
 
-  const provider = ['anthropic', 'webhook'].includes(stored.provider) ? stored.provider : 'cursor';
+  const provider = ['cursor', 'anthropic', 'webhook', 'openrouter'].includes(stored.provider) ? stored.provider
+    : (typeof DEFAULT_INSIGHTS_PROVIDER === 'string' ? DEFAULT_INSIGHTS_PROVIDER : 'cursor');
+  const openrouterApiKey = stored.openrouterApiKey
+    || (typeof OPENROUTER_API_KEY === 'string' ? OPENROUTER_API_KEY : '');
   const cursorApiKey = stored.cursorApiKey
     || (typeof CURSOR_API_KEY === 'string' ? CURSOR_API_KEY : '');
   const cursorDefault = typeof CURSOR_DEFAULT_MODEL === 'string' ? CURSOR_DEFAULT_MODEL : 'auto';
@@ -147,13 +136,14 @@ async function readSummarySettings() {
     cursorApiKey,
     webhookUrl,
     webhookAuth,
-    model: provider === 'cursor' ? (stored.cursorModel || cursorDefault) : stored.model,
-    // Defaults on — pre-generating is the entire point. Settings can turn it off
-    // for anyone who'd rather not spend a run on every video they open.
+    openrouterApiKey,
+    model: provider === 'openrouter' ? openrouterModelSetting(stored.openrouterModel)
+      : provider === 'cursor' ? (stored.cursorModel || cursorDefault) : stored.model,
     autoSummarize: stored.autoSummarize !== false,
     // The webhook path needs BOTH credentials: the webhook token fires the
     // automation, and a normal API key polls the run it creates.
     ready: provider === 'anthropic' ? !!stored.apiKey
+      : provider === 'openrouter' ? !!openrouterApiKey
       : provider === 'webhook' ? !!(webhookUrl && webhookAuth && cursorApiKey)
       : !!cursorApiKey
   };
@@ -170,11 +160,12 @@ function buildModelTranscript(transcript) {
  * Start generating a summary for `videoId`, or return the run already in flight.
  * Never starts a second run for a video — that's the whole contract here.
  */
-function startInsights(videoId, transcript, title, settings) {
+function startInsights(videoId, transcript, title, settings, initialInsights = null, parts = PARTS) {
   const existing = inFlightInsights.get(videoId);
   if (existing) return existing;
 
-  const entry = { progress: 'Starting…', startedAt: Date.now(), promise: null, partial: null };
+  const entry = { progress: 'Starting…', startedAt: Date.now(), promise: null, partial: initialInsights ? { ...initialInsights, ...Object.fromEntries(PARTS.map(part => [`${part}Pending`, parts.includes(part)])) } : null };
+  let checkpoint = Promise.resolve();
   inFlightInsights.set(videoId, entry);
   // Any part rerun already in flight is now superseded by this whole-summary run.
   bumpEpoch(videoId);
@@ -183,9 +174,12 @@ function startInsights(videoId, transcript, title, settings) {
   entry.promise = (async () => {
     try {
       const insights = await getInsights(buildModelTranscript(transcript), title || 'this video', {
+        initialInsights,
+        parts,
         provider: settings.provider,
         model: settings.model,
         apiKey: settings.apiKey,
+        openrouterApiKey: settings.openrouterApiKey,
         cursorApiKey: settings.cursorApiKey,
         webhookUrl: settings.webhookUrl,
         webhookAuth: settings.webhookAuth,
@@ -198,6 +192,14 @@ function startInsights(videoId, transcript, title, settings) {
         // later in the run gets it from INSIGHTS_STATUS instead of a spinner.
         onPartial: partial => {
           entry.partial = partial;
+          // Persist each settled part immediately. A worker interruption leaves
+          // explicit retryable gaps, never permanent 'generating' placeholders.
+          const saved = { ...partial, _pendingParts: PARTS.filter(part => partial[`${part}Pending`]) };
+          for (const part of PARTS) {
+            if (saved[`${part}Pending`]) saved[`${part}Error`] = 'Generation was interrupted. Retry this part to finish.';
+            delete saved[`${part}Pending`];
+          }
+          checkpoint = checkpoint.then(() => cacheInsights(videoId, saved));
           logPrep(`run PART   video=${videoId} parts=${Object.keys(partial).filter(k => !k.endsWith('Pending')).join(',')} at=${Math.round((Date.now() - entry.startedAt) / 1000)}s`);
           broadcast({ type: 'INSIGHTS_PARTIAL', videoId, insights: partial });
         },
@@ -206,6 +208,7 @@ function startInsights(videoId, transcript, title, settings) {
         onRunStarted: ids => { rememberCursorRun(videoId, ids).catch(() => {}); }
       });
 
+      await checkpoint;
       await cacheInsights(videoId, insights);
       logPrep(`run DONE   video=${videoId} took=${Math.round((Date.now() - entry.startedAt) / 1000)}s`);
       broadcast({ type: 'INSIGHTS_DONE', videoId, insights });
@@ -242,7 +245,7 @@ async function cacheInsights(videoId, insights) {
 //
 // Redoing a single part is a normal thing to want: the summary reads thin, or
 // the section list came back coarse. Rerunning that part alone costs one small
-// run, where the Summarize button re-pays for all three and discards two good
+// run, where the Summarize button re-pays for both parts and discards a good
 // ones.
 
 // videoId:part -> { progress, startedAt, promise }
@@ -268,10 +271,10 @@ function bumpEpoch(videoId) {
 }
 
 // Which star ids a regenerated part invalidates. The summary run also produces
-// the takeaways and the action list, so rerunning it retires those stars too.
-const STAR_KIND_BY_PART = { sections: ['section'], quotes: ['quote'], summary: ['takeaway', 'action'] };
+// the action list, so rerunning it retires those stars too.
+const STAR_KIND_BY_PART = { sections: ['section'], summary: ['action'] };
 
-const PART_LABELS = { summary: 'Summary', sections: 'Sections', quotes: 'Quotes' };
+const PART_LABELS = { summary: 'Summary', sections: 'Sections' };
 
 /**
  * Fold one freshly generated part into the cached summary.
@@ -279,7 +282,17 @@ const PART_LABELS = { summary: 'Summary', sections: 'Sections', quotes: 'Quotes'
  * Reads the cache rather than trusting anything the panel sends, so a rerun
  * started from a stale panel can't overwrite parts it wasn't regenerating.
  */
-async function mergePartIntoCache(videoId, part, value) {
+const cacheWrites = new Map();
+function mergePartIntoCache(videoId, part, value) {
+  const previous = cacheWrites.get(videoId) || Promise.resolve();
+  const write = previous.catch(() => {}).then(() => writePartIntoCache(videoId, part, value));
+  cacheWrites.set(videoId, write);
+  const cleanup = () => { if (cacheWrites.get(videoId) === write) cacheWrites.delete(videoId); };
+  write.then(cleanup, cleanup);
+  return write;
+}
+
+async function writePartIntoCache(videoId, part, value) {
   const insightsKey = STORE_PREFIX_INSIGHTS + videoId;
   const starKey = STORE_PREFIX_STARRED + videoId;
   const stored = await chrome.storage.local.get([insightsKey, starKey]);
@@ -287,6 +300,8 @@ async function mergePartIntoCache(videoId, part, value) {
   const merged = { ...(stored[insightsKey] || {}), ...value };
   // A part that just succeeded is no longer failing.
   delete merged[`${part}Error`];
+  delete merged[`${part}Pending`];
+  delete merged[`${part}Progress`];
 
   // The new items are not the old items, so stars keyed to that part's indices
   // no longer point where the reader put them. Stars on the OTHER parts stand.
@@ -321,6 +336,7 @@ async function handleRegeneratePart({ videoId, part, transcript, title }) {
   if (!settings.ready) {
     return {
       error: settings.provider === 'anthropic' ? 'NO_API_KEY'
+        : settings.provider === 'openrouter' ? 'NO_OPENROUTER_KEY'
         : settings.provider === 'webhook' ? 'NO_WEBHOOK'
         : 'NO_CURSOR_KEY'
     };
@@ -329,21 +345,18 @@ async function handleRegeneratePart({ videoId, part, transcript, title }) {
   let cues = Array.isArray(transcript) && transcript.length ? transcript : null;
   if (!cues) {
     // The transcript was cached when this video was first summarized, and a
-    // rerun is by definition a video we already have. Refetching would spend a
-    // Supadata credit to get back the exact same cues.
-    const txKey = STORE_PREFIX_TRANSCRIPT + videoId;
-    const stored = await chrome.storage.local.get([txKey]);
-    const cached = stored[txKey]?.transcript;
-    if (Array.isArray(cached) && cached.length) {
-      cues = cached;
-    } else {
-      const result = await fetchTranscript(videoId);
-      if (result.error) return { error: result.error };
-      cues = result.transcript;
-    }
+    // rerun is by definition a video we already have. fetchTranscript serves
+    // the saved English cues without spending a Supadata credit, and only
+    // fetches when the saved transcript is missing or not English.
+    const result = await fetchTranscript(videoId);
+    if (result.error) return { error: result.error };
+    cues = result.transcript;
   }
   if (!cues?.length) return { error: 'No transcript to summarize.' };
 
+  if (inFlightInsights.has(videoId)) return { error: 'This video is already being summarized.' };
+  const concurrent = inFlightParts.get(key);
+  if (concurrent) return { running: true, progress: concurrent.progress };
   const entry = { progress: 'Starting…', startedAt: Date.now(), promise: null };
   inFlightParts.set(key, entry);
   // If a whole-summary run starts after this point, its answer supersedes ours.
@@ -356,6 +369,7 @@ async function handleRegeneratePart({ videoId, part, transcript, title }) {
         provider: settings.provider,
         model: settings.model,
         apiKey: settings.apiKey,
+        openrouterApiKey: settings.openrouterApiKey,
         cursorApiKey: settings.cursorApiKey,
         webhookUrl: settings.webhookUrl,
         webhookAuth: settings.webhookAuth,
@@ -405,13 +419,22 @@ async function handleRegeneratePart({ videoId, part, transcript, title }) {
  * Called when a YouTube video opens, panel or no panel. Fetches and caches the
  * transcript, then starts the summary so the wait overlaps with watching.
  */
-async function prepareVideo(videoId, title) {
+const preparingVideos = new Map();
+function prepareVideo(videoId, title) {
+  if (preparingVideos.has(videoId)) return preparingVideos.get(videoId);
+  const pending = prepareVideoOnce(videoId, title).finally(() => preparingVideos.delete(videoId));
+  preparingVideos.set(videoId, pending);
+  return pending;
+}
+
+async function prepareVideoOnce(videoId, title) {
   if (!videoId) return;
   if (inFlightInsights.has(videoId)) return; // already running; not worth logging
 
   const insightsKey = STORE_PREFIX_INSIGHTS + videoId;
   const cached = await chrome.storage.local.get([insightsKey]);
-  if (cached[insightsKey]) {
+  const english = await prepareEnglishInsights(cached[insightsKey]);
+  if (cached[insightsKey] && !english.parts.length) {
     logPrep(`prep skip  video=${videoId} — already summarized (cached)`);
     return;
   }
@@ -426,6 +449,11 @@ async function prepareVideo(videoId, title) {
     return;
   }
 
+  if (english.parts.length) {
+    await handleGenerateInsights({ videoId, title });
+    return;
+  }
+
   logPrep(`prep BEGIN video=${videoId} — fetching transcript`);
 
   // Shares the in-flight map with the panel's own request, so opening the panel
@@ -437,36 +465,43 @@ async function prepareVideo(videoId, title) {
   }
 
   chrome.storage.local
-    .set({ [STORE_PREFIX_TRANSCRIPT + videoId]: { transcript: result.transcript, title: title || null } })
+    .set({ [STORE_PREFIX_TRANSCRIPT + videoId]: { transcript: result.transcript, title: title || null, lang: TRANSCRIPT_LANG } })
     .catch(() => {});
 
   startInsights(videoId, result.transcript, title, settings);
 }
 
-// Panel-initiated request. The panel already holds the transcript, so it passes
-// it through rather than making the worker re-fetch.
-//
-// `force` separates the two callers. The Summarize button is an explicit
-// regenerate and must always run. The panel's automatic path must not: a
-// background prep can finish in the gap between the panel reading the cache and
-// sending this, and without the cache check below that race silently paid for a
-// second identical run.
+// Panel-initiated request. Automatic requests reuse cached summaries; only an
+// explicit press of Summarize forces a new run. Concurrent panels share a run.
 async function handleGenerateInsights({ videoId, transcript, title, force }) {
   if (!videoId) return { error: 'No video to summarize.' };
 
   const existing = inFlightInsights.get(videoId);
   if (existing) return { running: true, progress: existing.progress, partial: existing.partial || null };
 
-  if (!force) {
-    const insightsKey = STORE_PREFIX_INSIGHTS + videoId;
-    const cached = await chrome.storage.local.get([insightsKey]);
-    if (cached[insightsKey]) return { insights: cached[insightsKey] };
+  // A manual retry of an incomplete result only regenerates failed/missing
+  // parts. A complete result still supports an explicit full regeneration.
+  const insightsKey = STORE_PREFIX_INSIGHTS + videoId;
+  const cached = await chrome.storage.local.get([insightsKey]);
+  const english = await prepareEnglishInsights(cached[insightsKey] || null);
+  const initialInsights = english.insights;
+  if (!force && initialInsights && !english.parts.length) return { insights: initialInsights };
+  const missing = initialInsights ? PARTS.filter(part => initialInsights[`${part}Error`]
+    || initialInsights[`${part}Pending`]
+    || (part === 'summary' ? !initialInsights.summary
+      : !Array.isArray(initialInsights.sections))) : PARTS;
+  const parts = missing.length ? missing : PARTS;
+
+  // Let existing part runs finish instead of superseding useful paid work.
+  if (PARTS.some(part => inFlightParts.has(`${videoId}:${part}`))) {
+    return { error: 'A part is already being regenerated. Its results will appear when ready.' };
   }
 
   const settings = await readSummarySettings();
   if (!settings.ready) {
     return {
       error: settings.provider === 'anthropic' ? 'NO_API_KEY'
+        : settings.provider === 'openrouter' ? 'NO_OPENROUTER_KEY'
         : settings.provider === 'webhook' ? 'NO_WEBHOOK'
         : 'NO_CURSOR_KEY'
     };
@@ -480,7 +515,10 @@ async function handleGenerateInsights({ videoId, transcript, title, force }) {
   }
   if (!cues?.length) return { error: 'No transcript to summarize.' };
 
-  const entry = startInsights(videoId, cues, title, settings);
+  if (PARTS.some(part => inFlightParts.has(`${videoId}:${part}`))) {
+    return { error: 'A part is already being regenerated. Its results will appear when ready.' };
+  }
+  const entry = startInsights(videoId, cues, title, settings, initialInsights, parts);
   return { running: true, progress: entry.progress, partial: entry.partial || null };
 }
 
@@ -601,7 +639,7 @@ async function resumeOrphanedCursorRuns() {
       // rerun is the opposite: the cache is exactly what it is replacing.
       const insightsKey = STORE_PREFIX_INSIGHTS + videoId;
       const cached = await chrome.storage.local.get([insightsKey]);
-      if (cached[insightsKey]) await forgetCursorRun(videoId, 'full');
+      if (cached[insightsKey] && !cached[insightsKey]._pendingParts?.length) await forgetCursorRun(videoId, 'full');
       else resumeInsights(videoId, modes.full, settings);
     }
   }
@@ -639,7 +677,10 @@ function resumePartRun(videoId, parts, settings) {
           return { superseded: true };
         }
 
-        const insights = await mergePartIntoCache(videoId, part, pickPartKeys(part, value));
+        const picked = pickPartKeys(part, value);
+        const issues = await detectEnglishOutputIssues(picked, part);
+        if (issues.length) throw new Error(issues.join('; ') + '. Retry this part to generate it in English.');
+        const insights = await mergePartIntoCache(videoId, part, picked);
         logPrep(`part RESUMED video=${videoId} part=${part}`);
         broadcast({ type: 'PART_DONE', videoId, part, insights });
         return { insights };
@@ -691,7 +732,18 @@ function resumeInsights(videoId, parts, settings) {
       if (!recovered.length) {
         throw settled[0]?.reason || new Error('Could not recover the Cursor run.');
       }
-      const insights = Object.assign({}, ...recovered);
+      const cacheKey = STORE_PREFIX_INSIGHTS + videoId;
+      const stored = await chrome.storage.local.get([cacheKey]);
+      let insights = Object.assign({}, stored[cacheKey] || {}, ...recovered);
+      const names = Object.keys(parts);
+      settled.forEach((result, index) => {
+        const part = names[index];
+        if (result.status === 'fulfilled') delete insights[`${part}Error`];
+        else insights[`${part}Error`] = result.reason?.message || `Could not recover ${part}.`;
+        delete insights[`${part}Pending`];
+      });
+      delete insights._pendingParts;
+      insights = (await prepareEnglishInsights(insights)).insights;
 
       await cacheInsights(videoId, insights);
       broadcast({ type: 'INSIGHTS_DONE', videoId, insights });
@@ -708,17 +760,6 @@ function resumeInsights(videoId, parts, settings) {
 
   return entry;
 }
-
-// ------------------------------------------------- Detecting videos to prep
-//
-// content.js sending VIDEO_CHANGED is NOT a sufficient trigger on its own:
-// reloading an unpacked extension orphans the content script in every already-
-// open tab, so those tabs never report anything until they're reloaded. That is
-// silent — you just never get a pre-generated summary and can't tell why.
-//
-// These two listeners watch tabs from the worker instead, which needs no
-// injected script. `tab.url` is readable here because the manifest already holds
-// host permissions for youtube.com, so this adds no new permission prompt.
 
 // Same rule as the panel's cleanTitle: while a playlist navigates, the tab
 // title is briefly the playlist ("Watch later") or bare "YouTube". Caching one
@@ -752,6 +793,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 // case an extension reload creates, and the one that made testing look broken.
 async function prepareOpenVideoTabs() {
   try {
+    const settings = await readSummarySettings();
+    if (!settings.autoSummarize || !settings.ready) return;
     const tabs = await chrome.tabs.query({ url: '*://*.youtube.com/watch*' });
     for (const tab of tabs) {
       const videoId = watchVideoId(tab.url);
@@ -766,10 +809,9 @@ async function prepareOpenVideoTabs() {
   }
 }
 
-// Both run on every worker spin-up: pick up runs a terminated worker abandoned,
-// and start prepping anything already on screen.
-resumeOrphanedCursorRuns().catch(() => {});
-prepareOpenVideoTabs().catch(() => {});
+// Rejoin existing paid runs before preparing open tabs. Cached successes and
+// unavailable results survive worker restarts, so they do not get fetched again.
+resumeOrphanedCursorRuns().catch(() => {}).then(prepareOpenVideoTabs).catch(() => {});
 
 // Runs in the page. Kept tiny and self-contained because it's injected by
 // value — it can't reference anything from this worker's scope.
@@ -838,11 +880,88 @@ async function seekVideo(tabId, time) {
 // (one credit) instead of each spending their own. Keyed by videoId because a
 // transcript is a property of the video, not the requesting tab.
 const inFlightTranscripts = new Map();
+// Supadata charges for HTTP 206 too. Reopening an unavailable video must not
+// spend another credit each time; the panel's Retry button bypasses this.
+const TRANSCRIPT_UNAVAILABLE_TTL_MS = 60 * 60 * 1000;
+// A video's caption languages rarely change, so "no English transcript" is
+// kept longer. With an hour, an open tab on a non-English video paid for the
+// same refused reply every hour through automatic preparation.
+const NO_ENGLISH_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
-function fetchTranscript(videoId) {
+// Transcripts are English only. Saved transcripts carry `lang` from this
+// change on; older ones (and replies without `lang`) are judged by their text.
+const TRANSCRIPT_LANG = 'en';
+
+function isEnglishLang(code) {
+  return typeof code === 'string' && /^en(?:[-_]|$)/i.test(code);
+}
+
+// Conservative: a short or mixed transcript counts as English. It only has to
+// catch a whole caption track in another language, like the Arabic track an
+// English talk came back with before this endpoint asked for English.
+async function transcriptLooksEnglish(transcript) {
+  // Sample evenly across the whole track, so an opening in another language
+  // (or an English intro on a foreign track) doesn't decide it alone.
+  const step = Math.max(1, Math.ceil(transcript.length / 300));
+  const text = transcript.filter((_, index) => index % step === 0).map(cue => cue.text).join('\n');
+  const letters = text.match(/\p{L}/gu) || [];
+  const nonLatin = letters.filter(letter => !/\p{Script=Latin}/u.test(letter)).length;
+  // Same bar as the summary language check: even a short track that is
+  // mostly another script isn't English.
+  if (nonLatin >= 12 && nonLatin > letters.length / 2) return false;
+  if (letters.length < 40) return true;
+  if (typeof chrome === 'undefined' || !chrome.i18n?.detectLanguage) return true;
+  const detected = await new Promise(resolve => {
+    try {
+      chrome.i18n.detectLanguage(text, result => resolve(chrome.runtime?.lastError ? null : result));
+    } catch {
+      resolve(null);
+    }
+  });
+  const top = detected?.languages?.slice().sort((a, b) => b.percentage - a.percentage)[0];
+  return !(detected?.isReliable && top && top.language !== 'en' && top.language !== 'und' && top.percentage >= 60);
+}
+
+function fetchTranscript(videoId, retryUnavailable = false) {
   let pending = inFlightTranscripts.get(videoId);
   if (!pending) {
-    pending = doFetchTranscript(videoId).finally(() => inFlightTranscripts.delete(videoId));
+    pending = (async () => {
+      const key = STORE_PREFIX_TRANSCRIPT + videoId;
+      const stored = await chrome.storage.local.get([key]);
+      const entry = stored[key];
+      const cached = entry?.transcript;
+      if (Array.isArray(cached) && cached.length) {
+        if (isEnglishLang(entry.lang)) return { transcript: cached };
+        if (!entry.lang && await transcriptLooksEnglish(cached)) {
+          // Tag it so the panel can serve it straight from storage next time.
+          await chrome.storage.local.set({ [key]: { ...entry, lang: TRANSCRIPT_LANG } }).catch(() => {});
+          return { transcript: cached };
+        }
+        // Saved before transcripts were English only (e.g. an Arabic caption
+        // track): fall through and fetch the English one.
+      }
+      const unavailable = stored[key]?.unavailable;
+      if (!retryUnavailable && unavailable?.until > Date.now()) {
+        const saved = unavailable.noEnglish ? 'for a week' : 'for one hour';
+        return { error: unavailable.error + ` This result is saved ${saved} to avoid extra charges. Retry checks again and may use a credit.` };
+      }
+
+      const result = await doFetchTranscript(videoId);
+      if (result.transcript?.length) {
+        // Cache before replying, even if the requesting panel closed or moved
+        // to another video while the request was running.
+        // Keep a title saved with a replaced (non-English) transcript.
+        const title = entry?.title || null;
+        await chrome.storage.local.set({ [key]: { transcript: result.transcript, title, lang: TRANSCRIPT_LANG } }).catch(() => {});
+      } else if (result.transcriptUnavailable) {
+        await chrome.storage.local.set({ [key]: { unavailable: {
+          error: result.error,
+          until: Date.now() + (result.noEnglish ? NO_ENGLISH_TTL_MS : TRANSCRIPT_UNAVAILABLE_TTL_MS),
+          ...(result.noEnglish ? { noEnglish: true } : {})
+        } } }).catch(() => {});
+      }
+      return result;
+    })().finally(() => inFlightTranscripts.delete(videoId));
     inFlightTranscripts.set(videoId, pending);
   }
   return pending;
@@ -896,8 +1015,7 @@ async function readSupadataError(resp) {
 async function doFetchTranscript(videoId) {
   const stored = await chrome.storage.local.get(['supadataKey']);
   // Fall back to the built-in key from lib/config.js. This worker fetches
-  // transcripts before the side panel has ever run, so it can't rely on the
-  // panel's first-run seeding having happened.
+  // transcripts on behalf of the panel and can also read the built-in key.
   const supadataKey = stored.supadataKey
     || (typeof SUPADATA_API_KEY === 'string' ? SUPADATA_API_KEY : '');
   if (!supadataKey) {
@@ -909,7 +1027,7 @@ async function doFetchTranscript(videoId) {
 
   for (let attempt = 0; ; attempt++) {
     resp = await fetch(
-      'https://api.supadata.ai/v1/youtube/transcript?videoId=' + videoId,
+      'https://api.supadata.ai/v1/youtube/transcript?videoId=' + encodeURIComponent(videoId) + '&lang=' + TRANSCRIPT_LANG,
       { headers: { 'x-api-key': supadataKey } }
     );
 
@@ -942,7 +1060,7 @@ async function doFetchTranscript(videoId) {
   // or it falls through and gets parsed as a transcript.
   if (resp.status === 206) {
     const detail = await readSupadataError(resp);
-    return { error: detail || 'No transcript available for this video' };
+    return { error: detail || 'No transcript available for this video', transcriptUnavailable: true };
   }
 
   if (!resp.ok) {
@@ -978,7 +1096,7 @@ async function doFetchTranscript(videoId) {
   const items = Array.isArray(data) ? data : data.content || data.transcript || data.results || [];
 
   if (!Array.isArray(items) || items.length === 0) {
-    return { error: 'No transcript available for this video' };
+    return { error: 'No transcript available for this video', transcriptUnavailable: true };
   }
 
   // Map to our format { startTime, text }
@@ -990,7 +1108,17 @@ async function doFetchTranscript(videoId) {
     }));
 
   if (transcript.length === 0) {
-    return { error: 'Transcript data was empty' };
+    return { error: 'Transcript data was empty', transcriptUnavailable: true };
+  }
+
+  // Supadata answers `lang=en` with the video's first caption track when it has
+  // no English one, and names the track it sent in `lang`. Only English is
+  // shown, so anything else counts as no transcript (remembered for a week,
+  // since Supadata charged for it and caption languages rarely change).
+  const lang = typeof data.lang === 'string' ? data.lang : '';
+  const english = lang ? isEnglishLang(lang) : await transcriptLooksEnglish(transcript);
+  if (!english) {
+    return { error: 'This video has no English transcript.', transcriptUnavailable: true, noEnglish: true };
   }
 
   return { transcript };
@@ -1000,7 +1128,7 @@ async function doFetchTranscript(videoId) {
 // from the tab's live URL and refuse to fetch a different one — that prevents a
 // mid-fetch SPA navigation from returning (and the panel caching) the wrong
 // video's transcript, and avoids spending a credit on a video nobody asked for.
-async function handleGetTranscript(tabId, expectedVideoId) {
+async function handleGetTranscript(tabId, expectedVideoId, retryUnavailable = false) {
   if (!tabId) return { error: 'No active tab' };
 
   try {
@@ -1013,14 +1141,14 @@ async function handleGetTranscript(tabId, expectedVideoId) {
     // without fetching; the navigation will drive a fresh load for the new id.
     if (expectedVideoId && videoId !== expectedVideoId) return { stale: true };
 
-    const result = await fetchTranscript(videoId);
+    const result = await fetchTranscript(videoId, retryUnavailable);
     if (result.error) return { error: result.error };
 
     // Title comes from THIS request's tab; the transcript array itself is shared.
     // Null rather than a stand-in string: the panel treats any non-empty title
     // as the real one, caches it, and then ignores the actual title when it
     // arrives a moment later — so a fabricated "YouTube Video" would stick.
-    return { transcript: result.transcript, title: cleanTabTitle(tab.title), videoId };
+    return { transcript: result.transcript, title: cleanTabTitle(tab.title), videoId, lang: TRANSCRIPT_LANG };
   } catch (err) {
     return { error: err.message || 'Unknown error fetching transcript' };
   }

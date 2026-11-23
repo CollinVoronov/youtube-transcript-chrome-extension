@@ -536,18 +536,8 @@ body {
   color: var(--text-secondary);
 }
 
-/* Sub-heading inside the Summary group (the takeaways). */
-.subgroup-label {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--text-muted);
-  font-weight: 600;
-  margin: 12px 0 6px;
-}
 
-/* Regenerate just this part. Quiet until hovered — it sits next to every
-   group, and three loud buttons would fight with the content. */
+/* Keep regeneration controls quiet beside their group headings. */
 .rerun-btn {
   background: none;
   border: none;
@@ -567,7 +557,7 @@ body {
   transform: rotate(90deg);
 }
 
-/* A clickable item card (section / insight / quote).
+/* A clickable item card (section / action / legacy insight).
    Kept tight: with one-line section descriptions this list is an index the eye
    scans, so rows sit close together instead of reading as separate blocks. */
 .item-card {
@@ -668,14 +658,7 @@ body {
   color: var(--accent);
 }
 
-.item-quote {
-  font-size: 13px;
-  color: var(--text-primary);
-  font-style: italic;
-  line-height: 1.55;
-  border-left: 2px solid var(--border);
-  padding-left: 10px;
-}
+
 
 /* Importance badges */
 .badge {
